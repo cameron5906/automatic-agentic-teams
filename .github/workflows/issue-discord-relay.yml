@@ -1,0 +1,221 @@
+name: Issue Discord Relay
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  issues: read
+
+jobs:
+  relay-to-discord:
+    name: Relay Issue Updates to Discord
+    runs-on: ubuntu-latest
+    if: |
+      github.actor == 'github-actions[bot]' ||
+      contains(github.event.comment.body || '', 'Claude') ||
+      contains(github.event.issue.body || '', 'Claude')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Process and relay to Discord
+        uses: actions/github-script@v7
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+          DISCORD_PRODUCT_WEBHOOK_URL: ${{ secrets.DISCORD_PRODUCT_WEBHOOK_URL }}
+        with:
+          script: |
+            const https = require('https');
+
+            const eventName = context.eventName;
+            const action = context.payload.action;
+            const issue = context.payload.issue;
+            const comment = context.payload.comment;
+
+            console.log(`Event: ${eventName}, Action: ${action}`);
+            console.log(`Issue #${issue.number}: ${issue.title}`);
+
+            // Determine what content we're working with
+            let content = '';
+            let isNewIssue = false;
+            let isNewComment = false;
+            let isEdit = false;
+            let previousBody = '';
+
+            if (eventName === 'issues') {
+              content = issue.body || '';
+              isNewIssue = action === 'opened';
+              isEdit = action === 'edited';
+              if (isEdit && context.payload.changes?.body?.from) {
+                previousBody = context.payload.changes.body.from;
+              }
+            } else if (eventName === 'issue_comment') {
+              content = comment.body || '';
+              isNewComment = action === 'created';
+              isEdit = action === 'edited';
+              if (isEdit && context.payload.changes?.body?.from) {
+                previousBody = context.payload.changes.body.from;
+              }
+            }
+
+            // Skip if edit has no meaningful changes
+            if (isEdit && previousBody === content) {
+              console.log('No content changes detected, skipping');
+              return;
+            }
+
+            // Build prompt for GPT-4o
+            let systemPrompt = '';
+            let userPrompt = '';
+
+            if (isNewIssue) {
+              systemPrompt = `You are a friendly engineer posting updates to a team's #dev Slack/Discord channel.
+            Write a brief, casual update about a new task/issue that was just created.
+            Keep it to 1-2 sentences, conversational tone, no bullet points.
+            Don't use markdown formatting except for the issue title header.`;
+
+              userPrompt = `A new issue was just created:
+
+            Title: ${issue.title}
+            Body: ${content}
+
+            Write a short #dev channel update about this new task. Start with "## ${issue.title}" as the header, then a blank line, then your casual update.`;
+            } else if (isNewComment) {
+              systemPrompt = `You are a friendly engineer posting updates to a team's #dev Slack/Discord channel.
+            Write a brief, casual update about progress on a task based on the new comment.
+            Keep it to 1-2 sentences, conversational tone, no bullet points.
+            Focus on what's new or interesting.`;
+
+              userPrompt = `New comment on issue "${issue.title}":
+
+            ${content}
+
+            Write a short #dev channel update about this progress. Start with "## ${issue.title}" as the header, then a blank line, then your casual update.`;
+            } else if (isEdit) {
+              systemPrompt = `You are a friendly engineer posting updates to a team's #dev Slack/Discord channel.
+            Compare the old and new content. If there's meaningful new information, write a brief update about what changed.
+            If the changes are trivial (typos, formatting), respond with exactly "SKIP".
+            Keep updates to 1-2 sentences, conversational tone, no bullet points.`;
+
+              userPrompt = `An issue/comment was edited.
+
+            Previous content:
+            ${previousBody}
+
+            New content:
+            ${content}
+
+            If there's meaningful new information, write a short #dev channel update. Start with "## ${issue.title}" as the header, then a blank line, then your casual update.
+            If changes are trivial, respond with exactly "SKIP".`;
+            } else {
+              console.log('No actionable event type');
+              return;
+            }
+
+            // Call OpenAI API
+            const openaiPayload = JSON.stringify({
+              model: 'gpt-4o',
+              messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt }
+              ],
+              max_tokens: 200,
+              temperature: 0.7
+            });
+
+            const openaiResponse = await new Promise((resolve, reject) => {
+              const req = https.request({
+                hostname: 'api.openai.com',
+                path: '/v1/chat/completions',
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+                }
+              }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => resolve(JSON.parse(data)));
+              });
+              req.on('error', reject);
+              req.write(openaiPayload);
+              req.end();
+            });
+
+            const message = openaiResponse.choices?.[0]?.message?.content?.trim();
+
+            if (!message) {
+              console.log('No message generated');
+              return;
+            }
+
+            if (message === 'SKIP') {
+              console.log('GPT-4o determined changes are trivial, skipping');
+              return;
+            }
+
+            console.log('Generated message:', message);
+
+            // Determine which webhooks to post to
+            const labels = issue.labels?.map(l => l.name.toLowerCase()) || [];
+            const isProductRelated = labels.some(l =>
+              l.includes('feature') || l.includes('product') || l.includes('enhancement') || l.includes('user')
+            );
+
+            const webhooks = [];
+
+            // Always post to dev channel
+            if (process.env.DISCORD_DEV_WEBHOOK_URL) {
+              webhooks.push({ url: process.env.DISCORD_DEV_WEBHOOK_URL, name: '#dev' });
+            }
+
+            // Post to product channel for product-related issues
+            if (isProductRelated && process.env.DISCORD_PRODUCT_WEBHOOK_URL) {
+              webhooks.push({ url: process.env.DISCORD_PRODUCT_WEBHOOK_URL, name: '#product' });
+            }
+
+            if (webhooks.length === 0) {
+              console.log('No webhook URLs configured');
+              return;
+            }
+
+            // Post to Discord webhook(s)
+            const discordPayload = JSON.stringify({
+              content: message,
+              username: 'Issue Relay',
+              allowed_mentions: { parse: [] }
+            });
+
+            for (const webhook of webhooks) {
+              await new Promise((resolve, reject) => {
+                const webhookUrl = new URL(webhook.url);
+                const req = https.request({
+                  hostname: webhookUrl.hostname,
+                  path: webhookUrl.pathname,
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json'
+                  }
+                }, (res) => {
+                  let data = '';
+                  res.on('data', chunk => data += chunk);
+                  res.on('end', () => {
+                    console.log(`Discord ${webhook.name} response:`, res.statusCode);
+                    resolve(data);
+                  });
+                });
+                req.on('error', reject);
+                req.write(discordPayload);
+                req.end();
+              });
+              console.log(`Posted to ${webhook.name} successfully`);
+            }

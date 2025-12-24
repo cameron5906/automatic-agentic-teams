@@ -1,0 +1,65 @@
+name: CI Tools
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/**'
+      - '.github/workflows/ci-tools.yml'
+  pull_request:
+    paths:
+      - 'tools/**'
+      - '.github/workflows/ci-tools.yml'
+
+jobs:
+  build-mcp-discord:
+    name: Build MCP Discord
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/mcp-discord
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: tools/mcp-discord/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+  build-discord-bot:
+    name: Build Discord Bot
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/discord-product-bot
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: tools/discord-product-bot/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build Docker image
+        run: docker build -t discord-bot-test .

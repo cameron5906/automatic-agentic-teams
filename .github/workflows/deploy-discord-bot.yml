@@ -1,0 +1,103 @@
+name: Deploy Discord Bot
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/discord-product-bot/**'
+      - '.github/workflows/deploy-discord-bot.yml'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'soyl-discord-bot' }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER || 'soyl-cluster' }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE || 'soyl-discord-bot' }}
+  ECS_TASK_DEFINITION: ${{ vars.ECS_TASK_DEFINITION || 'soyl-discord-bot' }}
+  CONTAINER_NAME: ${{ vars.CONTAINER_NAME || 'discord-bot' }}
+  # Discord channel/user IDs (required - no defaults, must be configured)
+  DISCORD_PRODUCT_CHANNEL_ID: ${{ vars.DISCORD_PRODUCT_CHANNEL_ID }}
+  DISCORD_DEV_CHANNEL_ID: ${{ vars.DISCORD_DEV_CHANNEL_ID }}
+  DISCORD_PR_CHANNEL_ID: ${{ vars.DISCORD_PR_CHANNEL_ID }}
+  DISCORD_TEAM_LEAD_USER_ID: ${{ vars.DISCORD_TEAM_LEAD_USER_ID }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy to Fargate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        working-directory: tools/discord-product-bot
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_DEFINITION }} \
+            --query taskDefinition > task-definition.json
+
+      - name: Update environment variables in task definition
+        run: |
+          # Update Discord channel IDs if provided via GitHub Variables
+          if [ -n "$DISCORD_PRODUCT_CHANNEL_ID" ]; then
+            jq --arg val "$DISCORD_PRODUCT_CHANNEL_ID" \
+              '(.containerDefinitions[0].environment[] | select(.name == "DISCORD_PRODUCT_CHANNEL_ID")).value = $val' \
+              task-definition.json > tmp.json && mv tmp.json task-definition.json
+          fi
+          if [ -n "$DISCORD_DEV_CHANNEL_ID" ]; then
+            jq --arg val "$DISCORD_DEV_CHANNEL_ID" \
+              '(.containerDefinitions[0].environment[] | select(.name == "DISCORD_DEV_CHANNEL_ID")).value = $val' \
+              task-definition.json > tmp.json && mv tmp.json task-definition.json
+          fi
+          if [ -n "$DISCORD_PR_CHANNEL_ID" ]; then
+            jq --arg val "$DISCORD_PR_CHANNEL_ID" \
+              '(.containerDefinitions[0].environment[] | select(.name == "DISCORD_PR_CHANNEL_ID")).value = $val' \
+              task-definition.json > tmp.json && mv tmp.json task-definition.json
+          fi
+          if [ -n "$DISCORD_TEAM_LEAD_USER_ID" ]; then
+            jq --arg val "$DISCORD_TEAM_LEAD_USER_ID" \
+              '(.containerDefinitions[0].environment[] | select(.name == "DISCORD_TEAM_LEAD_USER_ID")).value = $val' \
+              task-definition.json > tmp.json && mv tmp.json task-definition.json
+          fi
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
