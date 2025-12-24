@@ -1,0 +1,782 @@
+name: Issue Pipeline
+
+on:
+  issues:
+    types: [opened, labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number to process'
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+env:
+  AGENTS_DEFINITIONS_PATH: working/agents/definitions
+  AGENTS_MEMORY_PATH: working/agents/memory
+  ISSUES_PATH: working/issues
+
+jobs:
+  # ============================================================================
+  # STAGE 1: ORCHESTRATION
+  # Analyzes the issue and determines which agents should be activated
+  # ============================================================================
+  orchestrate:
+    name: Orchestrate Pipeline
+    runs-on: ubuntu-latest
+    outputs:
+      delegation: ${{ steps.parse.outputs.delegation }}
+      activate_documentation_sheriff: ${{ steps.parse.outputs.activate_documentation_sheriff }}
+      activate_infrastructure_engineer: ${{ steps.parse.outputs.activate_infrastructure_engineer }}
+      activate_product_owner: ${{ steps.parse.outputs.activate_product_owner }}
+      activate_project_manager: ${{ steps.parse.outputs.activate_project_manager }}
+      activate_security_engineer: ${{ steps.parse.outputs.activate_security_engineer }}
+      activate_software_engineer: ${{ steps.parse.outputs.activate_software_engineer }}
+      activate_tech_lead: ${{ steps.parse.outputs.activate_tech_lead }}
+      activate_test_engineer: ${{ steps.parse.outputs.activate_test_engineer }}
+      activate_ux_designer: ${{ steps.parse.outputs.activate_ux_designer }}
+      issue_context: ${{ steps.parse.outputs.issue_context }}
+      agent_prompts: ${{ steps.parse.outputs.agent_prompts }}
+      issue_number: ${{ steps.issue.outputs.number }}
+      issue_file: ${{ steps.seed.outputs.issue_file }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+          token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Get issue details
+        id: issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = context.payload.issue?.number || ${{ inputs.issue_number || 0 }};
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber
+            });
+            core.setOutput('number', issue.number);
+            core.setOutput('title', issue.title);
+            core.setOutput('body', issue.body || '');
+            core.setOutput('labels', issue.labels.map(l => l.name).join(','));
+            core.setOutput('author', issue.user.login);
+            core.setOutput('created_at', issue.created_at);
+
+      - name: Ensure docs directories exist
+        run: |
+          # Create docs structure if not exists
+          mkdir -p docs/adr docs/research
+
+          # Seed docs/README.md if not exists
+          if [ ! -f "docs/README.md" ]; then
+            cat << 'DOCS_EOF' > docs/README.md
+          # Documentation
+
+          This directory contains project documentation including architectural decision records and research notes.
+
+          ## Contents
+
+          ### [Architecture Decision Records](./adr/)
+
+          Significant architectural decisions are documented as ADRs.
+
+          | ADR | Title | Status | Date |
+          |-----|-------|--------|------|
+          | _No ADRs yet_ | | | |
+
+          ### [Research](./research/)
+
+          Research documents capture investigation findings and exploratory analysis.
+
+          | Document | Scope | Date |
+          |----------|-------|------|
+          | _No research documents yet_ | | |
+          DOCS_EOF
+          fi
+
+          # Seed docs/adr/README.md if not exists
+          if [ ! -f "docs/adr/README.md" ]; then
+            cat << 'ADR_EOF' > docs/adr/README.md
+          # Architecture Decision Records
+
+          ## Table of Contents
+
+          | ADR | Title | Status | Date |
+          |-----|-------|--------|------|
+          | _No ADRs yet_ | | | |
+
+          ## Filename Format
+
+          `YYYY-MM-DD-short-description.md`
+
+          ## ADR Template
+
+          ```markdown
+          # ADR-XXX: Title
+
+          **Status:** Proposed | Accepted | Deprecated | Superseded
+
+          **Date:** YYYY-MM-DD
+
+          ## Context
+
+          ## Decision
+
+          ## Consequences
+
+          ### Positive
+
+          -
+
+          ### Negative
+
+          -
+
+          ### Neutral
+
+          -
+
+          ## Implementation Checklist
+
+          ### Domain Layer
+
+          - [ ]
+
+          ### Infrastructure Layer
+
+          - [ ]
+
+          ### Jobs Layer
+
+          - [ ]
+
+          ### Tests
+
+          - [ ]
+
+          ### Documentation
+
+          - [ ]
+
+          ## Alternatives Considered
+
+          ### 1.
+
+          ## Invariants
+
+          1.
+
+          ## Related Decisions
+
+          - ADR-
+
+          ## References
+
+          -
+          ```
+          ADR_EOF
+          fi
+
+          # Seed docs/research/README.md if not exists
+          if [ ! -f "docs/research/README.md" ]; then
+            cat << 'RESEARCH_EOF' > docs/research/README.md
+          # Research Documents
+
+          ## Table of Contents
+
+          | Document | Scope | Reviewer | Date |
+          |----------|-------|----------|------|
+          | _No research documents yet_ | | | |
+
+          ## Filename Format
+
+          `YYYY-MM-DD-short-description.md`
+
+          ## Research Template
+
+          ```markdown
+          # Title
+
+          **Date:** YYYY-MM-DD
+          **Reviewer:** Agent or person name
+          **Scope:** Brief description
+
+          ---
+
+          ## Executive Summary
+
+          ---
+
+          ## Findings
+
+          ---
+
+          ## Recommendations
+
+          ---
+
+          ## Files Reviewed
+
+          ### Frontend
+
+          -
+
+          ### Backend Controllers
+
+          -
+
+          ### Backend Pipeline
+
+          -
+
+          ### Backend Core/Infrastructure
+
+          -
+          ```
+          RESEARCH_EOF
+          fi
+
+          # Stage any new docs files
+          git add docs/ || true
+
+      - name: Seed issue context file
+        id: seed
+        run: |
+          mkdir -p ${{ env.ISSUES_PATH }}
+          ISSUE_FILE="${{ env.ISSUES_PATH }}/${{ steps.issue.outputs.number }} ${{ steps.issue.outputs.title }}.md"
+          ISSUE_FILE=$(echo "$ISSUE_FILE" | sed 's/[<>:"|?*]/_/g')
+
+          cat << 'EOF' > "$ISSUE_FILE"
+          # Issue #${{ steps.issue.outputs.number }}: ${{ steps.issue.outputs.title }}
+
+          **Author:** ${{ steps.issue.outputs.author }}
+          **Created:** ${{ steps.issue.outputs.created_at }}
+          **Labels:** ${{ steps.issue.outputs.labels }}
+
+          ## Original Description
+
+          ${{ steps.issue.outputs.body }}
+
+          ---
+
+          ## Pre-Planning Context
+
+          _This section will be populated by pre-work agents._
+
+          ### Documentation Context
+          _Pending documentation-sheriff (pre)_
+
+          ### Infrastructure Context
+          _Pending infrastructure-engineer (pre)_
+
+          ### Security Context
+          _Pending security-engineer (pre)_
+
+          ---
+
+          ## Planning Decisions
+
+          _This section will be populated by planning agents._
+
+          ### Product Requirements
+          _Pending product-owner_
+
+          ### UX Design Notes
+          _Pending ux-designer_
+
+          ### Technical Approach
+          _Pending tech-lead_
+
+          ---
+
+          ## Implementation Notes
+
+          _This section will be populated during development._
+
+          ---
+
+          ## Post-Work Validation
+
+          _This section will be populated by post-work agents._
+
+          EOF
+
+          git add "$ISSUE_FILE"
+          git add docs/ || true
+          git commit -m "chore: seed issue context and docs for #${{ steps.issue.outputs.number }}"
+          git push
+
+          echo "issue_file=$ISSUE_FILE" >> $GITHUB_OUTPUT
+
+      - name: Load agent definitions
+        id: definitions
+        run: |
+          AGENTS_JSON="[]"
+          if [ -d "${{ env.AGENTS_DEFINITIONS_PATH }}" ]; then
+            AGENTS_JSON=$(find ${{ env.AGENTS_DEFINITIONS_PATH }} -name "*.md" -type f | while read file; do
+              name=$(basename "$file" .md)
+              echo "{\"name\": \"$name\", \"path\": \"$file\"}"
+            done | jq -s '.')
+          fi
+          echo "agents=$AGENTS_JSON" >> $GITHUB_OUTPUT
+
+      - name: Run orchestrator
+        id: orchestrator
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          prompt: |
+            You are the Pipeline Orchestrator. Your job is to analyze a GitHub issue and determine which agents should be activated to handle it.
+
+            ## Issue Details
+            - Number: #${{ steps.issue.outputs.number }}
+            - Title: ${{ steps.issue.outputs.title }}
+            - Body: ${{ steps.issue.outputs.body }}
+            - Labels: ${{ steps.issue.outputs.labels }}
+
+            ## Available Agents
+            ${{ steps.definitions.outputs.agents }}
+
+            ## Agent Roster
+            - documentation-sheriff: Pre/post documentation context and updates
+            - code-reviewer: Reviews code quality and PR approval
+            - infrastructure-engineer: AWS/CDK infrastructure changes
+            - product-owner: Product alignment for new features (references ABOUT.md for business requirements)
+            - project-manager: Team coordination and TEAM.md maintenance
+            - security-engineer: Security planning and code review
+            - software-engineer: Product development and git commits
+            - tech-lead: Architectural planning and bug identification
+            - test-engineer: Test creation and verification
+            - ux-designer: Frontend feature planning
+
+            ## Key Repository Files
+            - **ABOUT.md**: Contains product information, business requirements, and milestones. Planning agents should reference this.
+            - **DEVLOG.md**: Large development log file. To read recent context, grep for "## Session" and read the latest entry.
+            - **working/issues/${{ steps.issue.outputs.number }}*.md**: Issue context file seeded for this pipeline run.
+
+            ## Your Task
+            1. Analyze the issue to understand its scope and requirements
+            2. Review recent git history for context
+            3. Check ABOUT.md for relevant product context
+            4. Grep DEVLOG.md for "## Session" to find the latest session entry for recent work context
+            5. Determine which agents should be activated
+            6. Create specific prompts for each activated agent
+
+            ## Required Output
+            You MUST output a JSON object with exactly this structure:
+            ```json
+            {
+              "issue_context": "Brief summary of what this issue is about",
+              "delegation": {
+                "documentation_sheriff": { "activate": boolean, "phase": "pre|post|both", "prompt": "specific task" },
+                "infrastructure_engineer": { "activate": boolean, "phase": "pre|post|both", "prompt": "specific task" },
+                "product_owner": { "activate": boolean, "prompt": "specific task" },
+                "project_manager": { "activate": boolean, "prompt": "specific task" },
+                "security_engineer": { "activate": boolean, "phase": "pre|post|both", "prompt": "specific task" },
+                "software_engineer": { "activate": boolean, "prompt": "specific task" },
+                "tech_lead": { "activate": boolean, "prompt": "specific task" },
+                "test_engineer": { "activate": boolean, "prompt": "specific task" },
+                "ux_designer": { "activate": boolean, "prompt": "specific task" }
+              }
+            }
+            ```
+
+            Output ONLY the JSON, no additional text.
+
+      - name: Parse orchestrator output
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `${{ steps.orchestrator.outputs.result }}`;
+            const jsonMatch = output.match(/\{[\s\S]*\}/);
+            if (!jsonMatch) {
+              throw new Error('Could not parse orchestrator output');
+            }
+            const delegation = JSON.parse(jsonMatch[0]);
+
+            core.setOutput('activate_documentation_sheriff', delegation.delegation.documentation_sheriff?.activate || false);
+            core.setOutput('activate_infrastructure_engineer', delegation.delegation.infrastructure_engineer?.activate || false);
+            core.setOutput('activate_product_owner', delegation.delegation.product_owner?.activate || false);
+            core.setOutput('activate_project_manager', delegation.delegation.project_manager?.activate || false);
+            core.setOutput('activate_security_engineer', delegation.delegation.security_engineer?.activate || false);
+            core.setOutput('activate_software_engineer', delegation.delegation.software_engineer?.activate || false);
+            core.setOutput('activate_tech_lead', delegation.delegation.tech_lead?.activate || false);
+            core.setOutput('activate_test_engineer', delegation.delegation.test_engineer?.activate || false);
+            core.setOutput('activate_ux_designer', delegation.delegation.ux_designer?.activate || false);
+            core.setOutput('issue_context', delegation.issue_context);
+            core.setOutput('delegation', JSON.stringify(delegation.delegation));
+            core.setOutput('agent_prompts', JSON.stringify(delegation.delegation));
+
+  # ============================================================================
+  # STAGE 2: PRE-WORK AGENTS
+  # Agents that need to run before main development work
+  # ============================================================================
+  pre-documentation:
+    name: Documentation Sheriff (Pre)
+    needs: orchestrate
+    if: needs.orchestrate.outputs.activate_documentation_sheriff == 'true'
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: documentation-sheriff
+      phase: pre
+      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
+      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
+      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+    secrets: inherit
+
+  pre-infrastructure:
+    name: Infrastructure Engineer (Pre)
+    needs: orchestrate
+    if: needs.orchestrate.outputs.activate_infrastructure_engineer == 'true'
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: infrastructure-engineer
+      phase: pre
+      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
+      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
+      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+    secrets: inherit
+
+  pre-security:
+    name: Security Engineer (Pre)
+    needs: orchestrate
+    if: needs.orchestrate.outputs.activate_security_engineer == 'true'
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: security-engineer
+      phase: pre
+      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
+      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
+      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+    secrets: inherit
+
+  # ============================================================================
+  # STAGE 3: PLANNING AGENTS
+  # Product, UX, and Tech Lead planning before development
+  # ============================================================================
+  planning-product:
+    name: Product Owner
+    needs: [orchestrate, pre-documentation, pre-infrastructure, pre-security]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_product_owner == 'true'
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: product-owner
+      phase: main
+      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
+      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
+      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+    secrets: inherit
+
+  planning-ux:
+    name: UX Designer
+    needs: [orchestrate, pre-documentation, pre-infrastructure, pre-security]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_ux_designer == 'true'
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: ux-designer
+      phase: main
+      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
+      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
+      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+    secrets: inherit
+
+  planning-tech-lead:
+    name: Tech Lead
+    needs: [orchestrate, pre-documentation, pre-infrastructure, pre-security]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_tech_lead == 'true'
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: tech-lead
+      phase: main
+      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
+      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
+      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+    secrets: inherit
+
+  # ============================================================================
+  # STAGE 4: DEVELOPMENT
+  # Main development work by Software and Infrastructure Engineers
+  # ============================================================================
+  development-software:
+    name: Software Engineer
+    needs: [orchestrate, planning-product, planning-ux, planning-tech-lead]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_software_engineer == 'true'
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: software-engineer
+      phase: main
+      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
+      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
+      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      planning_context: |
+        Product Owner: ${{ needs.planning-product.outputs.result || 'Not activated' }}
+        UX Designer: ${{ needs.planning-ux.outputs.result || 'Not activated' }}
+        Tech Lead: ${{ needs.planning-tech-lead.outputs.result || 'Not activated' }}
+    secrets: inherit
+
+  development-infrastructure:
+    name: Infrastructure Engineer (Main)
+    needs: [orchestrate, planning-tech-lead]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_infrastructure_engineer == 'true'
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: infrastructure-engineer
+      phase: main
+      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
+      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
+      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      planning_context: |
+        Tech Lead: ${{ needs.planning-tech-lead.outputs.result || 'Not activated' }}
+    secrets: inherit
+
+  # ============================================================================
+  # STAGE 5: POST-WORK AGENTS
+  # Testing, documentation updates, and security review
+  # ============================================================================
+  post-test:
+    name: Test Engineer
+    needs: [orchestrate, development-software, development-infrastructure]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_test_engineer == 'true' &&
+      (needs.development-software.result == 'success' || needs.development-infrastructure.result == 'success')
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: test-engineer
+      phase: post
+      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
+      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
+      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+    secrets: inherit
+
+  post-security:
+    name: Security Engineer (Post)
+    needs: [orchestrate, development-software, development-infrastructure]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_security_engineer == 'true' &&
+      (needs.development-software.result == 'success' || needs.development-infrastructure.result == 'success')
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: security-engineer
+      phase: post
+      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
+      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
+      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+    secrets: inherit
+
+  post-documentation:
+    name: Documentation Sheriff (Post)
+    needs: [orchestrate, development-software, development-infrastructure, post-test]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_documentation_sheriff == 'true' &&
+      (needs.development-software.result == 'success' || needs.development-infrastructure.result == 'success')
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: documentation-sheriff
+      phase: post
+      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
+      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
+      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+    secrets: inherit
+
+  # ============================================================================
+  # STAGE 6: PROJECT MANAGEMENT
+  # Update team tracking and create PR
+  # ============================================================================
+  project-management:
+    name: Project Manager
+    needs: [orchestrate, post-test, post-security, post-documentation]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_project_manager == 'true'
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: project-manager
+      phase: post
+      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
+      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
+      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+    secrets: inherit
+
+  # ============================================================================
+  # STAGE 7: CREATE PR
+  # Create pull request with all changes
+  # ============================================================================
+  create-pr:
+    name: Create Pull Request
+    needs: [orchestrate, project-management, post-documentation]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.create-pr.outputs.pr_number }}
+      pr_url: ${{ steps.create-pr.outputs.pr_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+
+      - name: Get issue number
+        id: issue
+        run: |
+          echo "number=${{ needs.orchestrate.outputs.issue_number }}" >> $GITHUB_OUTPUT
+
+      - name: Check for changes
+        id: changes
+        run: |
+          git fetch origin main
+          if git diff --quiet origin/main..HEAD; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pull Request
+        id: create-pr
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const issueNumber = ${{ steps.issue.outputs.number }};
+            const branchName = `issue-${issueNumber}-auto`;
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Auto] Resolves #${issueNumber}`,
+              body: `## Automated PR for Issue #${issueNumber}\n\nThis PR was automatically generated by the AI agent pipeline.\n\n### Issue Context\n${{ needs.orchestrate.outputs.issue_context }}\n\nCloses #${issueNumber}`,
+              head: branchName,
+              base: 'main'
+            });
+
+            core.setOutput('pr_number', pr.number);
+            core.setOutput('pr_url', pr.html_url);
+
+  # ============================================================================
+  # STAGE 8: CODE REVIEW
+  # Final code review of the PR
+  # ============================================================================
+  code-review:
+    name: Code Reviewer
+    needs: [orchestrate, create-pr]
+    if: |
+      always() &&
+      needs.create-pr.result == 'success' &&
+      needs.create-pr.outputs.pr_number != ''
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: code-reviewer
+      phase: review
+      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
+      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
+      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      pr_number: ${{ needs.create-pr.outputs.pr_number }}
+    secrets: inherit
+
+  # ============================================================================
+  # STAGE 9: WRAP-UP
+  # Orchestrator appends session summary to DEVLOG.md
+  # ============================================================================
+  wrap-up:
+    name: Wrap Up Session
+    needs: [orchestrate, code-review, create-pr]
+    if: always() && needs.orchestrate.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin main
+
+      - name: Append to DEVLOG.md
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          prompt: |
+            You are the Pipeline Orchestrator wrapping up a session.
+
+            ## Session Summary
+            - Issue: #${{ needs.orchestrate.outputs.issue_number }}
+            - Context: ${{ needs.orchestrate.outputs.issue_context }}
+            - PR Created: ${{ needs.create-pr.outputs.pr_url || 'None' }}
+            - Code Review Result: ${{ needs.code-review.result || 'Skipped' }}
+            - Code Review Status: ${{ needs.code-review.outputs.review_status || 'Not Available' }}
+
+            ## Your Task
+            1. Read the issue context file at working/issues/ for issue #${{ needs.orchestrate.outputs.issue_number }}
+            2. Grep DEVLOG.md for "## Session" to find the last session entry
+            3. Append a new session entry to DEVLOG.md with:
+               - Session timestamp
+               - Issue number and title
+               - Summary of what was accomplished
+               - Agents that participated
+               - Any notable decisions or changes
+               - Link to PR if created
+               - **Code Review Status** (APPROVED/REJECTED) - Include prominently if review occurred
+            4. Commit the DEVLOG.md update
+
+            Use the format:
+            ```
+            ## Session [YYYY-MM-DD HH:MM UTC]
+
+            ### Issue #X: Title
+
+            **Summary:** Brief description of work done
+
+            **Agents Activated:**
+            - agent-name: what they did
+
+            **Key Decisions:**
+            - Decision 1
+            - Decision 2
+
+            **PR:** #X or N/A
+
+            ---
+            ```
