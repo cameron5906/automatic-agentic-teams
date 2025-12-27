@@ -10,6 +10,9 @@ on:
         required: true
         type: number
 
+env:
+  TEMPLATE_REPO_NAME: automatic-agentic-teams
+
 concurrency:
   group: issue-pipeline-global
   cancel-in-progress: false
@@ -28,6 +31,7 @@ jobs:
   orchestrate:
     name: Orchestrate Pipeline
     runs-on: ubuntu-latest
+    if: github.event.repository.name != 'automatic-agentic-teams'
     outputs:
       delegation: ${{ steps.parse.outputs.delegation }}
       activate_documentation_sheriff: ${{ steps.parse.outputs.activate_documentation_sheriff }}

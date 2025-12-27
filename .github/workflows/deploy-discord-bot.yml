@@ -29,6 +29,7 @@ jobs:
   build-and-deploy:
     name: Build and Deploy to Fargate
     runs-on: ubuntu-latest
+    if: github.event.repository.name != 'automatic-agentic-teams'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

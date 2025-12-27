@@ -32,6 +32,7 @@ jobs:
   analyze-drift:
     name: Analyze Documentation Drift
     runs-on: ubuntu-latest
+    if: github.event.repository.name != 'automatic-agentic-teams'
     outputs:
       drift_detected: ${{ steps.analyze.outputs.drift_detected }}
       drift_report: ${{ steps.analyze.outputs.report }}

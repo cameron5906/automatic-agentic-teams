@@ -38,6 +38,7 @@ jobs:
   detect-changes:
     name: Detect Structural Changes
     runs-on: ubuntu-latest
+    if: github.event.repository.name != 'automatic-agentic-teams'
     outputs:
       has_changes: ${{ steps.check.outputs.has_changes }}
       change_type: ${{ steps.check.outputs.change_type }}

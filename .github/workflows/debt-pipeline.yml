@@ -23,6 +23,7 @@ jobs:
   curate_debt:
     name: Curate Technical Debt
     runs-on: ubuntu-latest
+    if: github.event.repository.name != 'automatic-agentic-teams'
     outputs:
       items_to_process: ${{ steps.parse.outputs.items }}
       items_count: ${{ steps.parse.outputs.count }}

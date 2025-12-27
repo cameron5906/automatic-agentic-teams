@@ -24,6 +24,7 @@ jobs:
   deploy:
     name: Deploy Business Bot
     runs-on: ubuntu-latest
+    if: github.event.repository.name != 'automatic-agentic-teams'
 
     steps:
       - name: Checkout

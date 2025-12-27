@@ -37,6 +37,7 @@ jobs:
   collect-metrics:
     name: Collect Development Metrics
     runs-on: ubuntu-latest
+    if: github.event.repository.name != 'automatic-agentic-teams'
     outputs:
       issues_closed_count: ${{ steps.issues.outputs.count }}
       issues_closed_list: ${{ steps.issues.outputs.list }}

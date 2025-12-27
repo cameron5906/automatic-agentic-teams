@@ -44,9 +44,11 @@ jobs:
     name: Extract Context
     runs-on: ubuntu-latest
     # Run if: (1) automatic trigger with changes_requested, or (2) manual trigger
+    # Never run on template repo
     if: |
-      github.event_name == 'workflow_dispatch' ||
-      github.event.review.state == 'changes_requested'
+      github.event.repository.name != 'automatic-agentic-teams' &&
+      (github.event_name == 'workflow_dispatch' ||
+      github.event.review.state == 'changes_requested')
     outputs:
       issue_number: ${{ steps.parse.outputs.issue_number }}
       work_branch: ${{ steps.parse.outputs.work_branch }}

@@ -15,6 +15,7 @@ jobs:
   build-mcp-discord:
     name: Build MCP Discord
     runs-on: ubuntu-latest
+    if: github.event.repository.name != 'automatic-agentic-teams'
     defaults:
       run:
         working-directory: tools/mcp-discord
@@ -38,6 +39,7 @@ jobs:
   build-discord-bot:
     name: Build Discord Bot
     runs-on: ubuntu-latest
+    if: github.event.repository.name != 'automatic-agentic-teams'
     defaults:
       run:
         working-directory: tools/discord-product-bot

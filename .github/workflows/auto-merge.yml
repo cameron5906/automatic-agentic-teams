@@ -32,6 +32,7 @@ jobs:
   check-mergeable:
     name: Check Merge Eligibility
     runs-on: ubuntu-latest
+    if: github.event.repository.name != 'automatic-agentic-teams'
     outputs:
       should_merge: ${{ steps.decision.outputs.should_merge }}
       ci_failed: ${{ steps.decision.outputs.ci_failed }}

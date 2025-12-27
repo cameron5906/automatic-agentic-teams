@@ -14,9 +14,10 @@ jobs:
     name: Relay Issue Updates to Discord
     runs-on: ubuntu-latest
     if: |
-      github.actor == 'github-actions[bot]' ||
+      github.event.repository.name != 'automatic-agentic-teams' &&
+      (github.actor == 'github-actions[bot]' ||
       contains(github.event.comment.body || '', 'Claude') ||
-      contains(github.event.issue.body || '', 'Claude')
+      contains(github.event.issue.body || '', 'Claude'))
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

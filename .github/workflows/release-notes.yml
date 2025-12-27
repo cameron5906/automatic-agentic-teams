@@ -30,6 +30,7 @@ jobs:
   collect-changes:
     name: Collect Changes
     runs-on: ubuntu-latest
+    if: github.event.repository.name != 'automatic-agentic-teams'
     outputs:
       current_tag: ${{ steps.tags.outputs.current }}
       previous_tag: ${{ steps.tags.outputs.previous }}
