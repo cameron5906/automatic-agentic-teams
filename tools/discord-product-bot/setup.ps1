@@ -133,7 +133,7 @@ if (-not $ECR_URI -or $ECR_URI -eq "None") {
 Write-Host "  ECR URI: $ECR_URI" -ForegroundColor Gray
 
 # Login to ECR
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $ECR_URI.Split('/')[0]
+aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin $ECR_URI.Split('/')[0]
 
 # Build for ARM64
 docker build --platform linux/arm64 -t "${ECR_URI}:latest" .

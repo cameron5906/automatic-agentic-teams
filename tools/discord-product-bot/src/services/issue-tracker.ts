@@ -27,6 +27,28 @@ export interface TrackedIssueUpdate {
   issue: TrackedIssue;
 }
 
+/**
+ * Represents a suggested issue for next work selection.
+ */
+export interface SuggestedIssue {
+  number: number;
+  title: string;
+  reason: string;
+}
+
+/**
+ * Represents a suggestion message posted to Discord.
+ */
+export interface IssueSuggestion {
+  id: number;
+  messageId: string;
+  channelId: string;
+  suggestedIssues: SuggestedIssue[];
+  createdAt: number;
+  resolvedAt: number | null;
+  selectedIssue: number | null;
+}
+
 let db: Database.Database | null = null;
 
 function getDb(): Database.Database {
@@ -59,6 +81,24 @@ function migrate(database: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_tracked_issues_linked_pr
       ON tracked_issues(linked_pr_number);
+
+    -- Table for tracking issue suggestions posted to Discord
+    -- Used to correlate responses to suggestion messages
+    CREATE TABLE IF NOT EXISTS issue_suggestions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      message_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      suggested_issues TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      resolved_at INTEGER,
+      selected_issue INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_issue_suggestions_message
+      ON issue_suggestions(message_id);
+
+    CREATE INDEX IF NOT EXISTS idx_issue_suggestions_pending
+      ON issue_suggestions(resolved_at);
   `);
 }
 
@@ -302,4 +342,118 @@ export async function checkPRStatus(prNumber: number): Promise<'open' | 'merged'
     console.error(`[IssueTracker] Failed to check PR #${prNumber} status:`, error);
     return 'open';
   }
+}
+
+// ============================================================================
+// Issue Suggestion Functions
+// ============================================================================
+
+/**
+ * Stores a new issue suggestion posted to Discord.
+ */
+export function createIssueSuggestion(
+  messageId: string,
+  channelId: string,
+  suggestedIssues: SuggestedIssue[]
+): number {
+  const database = getDb();
+  const stmt = database.prepare(`
+    INSERT INTO issue_suggestions (
+      message_id, channel_id, suggested_issues, created_at
+    ) VALUES (
+      @message_id, @channel_id, @suggested_issues, @created_at
+    )
+  `);
+
+  const result = stmt.run({
+    message_id: messageId,
+    channel_id: channelId,
+    suggested_issues: JSON.stringify(suggestedIssues),
+    created_at: Date.now(),
+  });
+
+  console.log(`[IssueTracker] Created suggestion ${result.lastInsertRowid} with ${suggestedIssues.length} issues`);
+  return result.lastInsertRowid as number;
+}
+
+/**
+ * Gets the most recent pending (unresolved) suggestion for a channel.
+ */
+export function getPendingSuggestion(channelId: string): IssueSuggestion | null {
+  const database = getDb();
+  const stmt = database.prepare(`
+    SELECT * FROM issue_suggestions 
+    WHERE channel_id = ? AND resolved_at IS NULL
+    ORDER BY created_at DESC
+    LIMIT 1
+  `);
+
+  const row = stmt.get(channelId) as any;
+  if (!row) return null;
+
+  return mapRowToIssueSuggestion(row);
+}
+
+/**
+ * Gets a suggestion by its Discord message ID.
+ */
+export function getSuggestionByMessageId(messageId: string): IssueSuggestion | null {
+  const database = getDb();
+  const stmt = database.prepare(`
+    SELECT * FROM issue_suggestions WHERE message_id = ?
+  `);
+
+  const row = stmt.get(messageId) as any;
+  if (!row) return null;
+
+  return mapRowToIssueSuggestion(row);
+}
+
+/**
+ * Marks a suggestion as resolved with the selected issue.
+ */
+export function resolveSuggestion(suggestionId: number, selectedIssue: number): void {
+  const database = getDb();
+  const stmt = database.prepare(`
+    UPDATE issue_suggestions 
+    SET resolved_at = @resolved_at, selected_issue = @selected_issue
+    WHERE id = @id
+  `);
+
+  stmt.run({
+    id: suggestionId,
+    resolved_at: Date.now(),
+    selected_issue: selectedIssue,
+  });
+
+  console.log(`[IssueTracker] Resolved suggestion ${suggestionId} with issue #${selectedIssue}`);
+}
+
+/**
+ * Cancels a pending suggestion (e.g., when a new one is posted).
+ */
+export function cancelPendingSuggestions(channelId: string): void {
+  const database = getDb();
+  const stmt = database.prepare(`
+    UPDATE issue_suggestions 
+    SET resolved_at = @resolved_at
+    WHERE channel_id = @channel_id AND resolved_at IS NULL
+  `);
+
+  stmt.run({
+    channel_id: channelId,
+    resolved_at: Date.now(),
+  });
+}
+
+function mapRowToIssueSuggestion(row: any): IssueSuggestion {
+  return {
+    id: row.id,
+    messageId: row.message_id,
+    channelId: row.channel_id,
+    suggestedIssues: JSON.parse(row.suggested_issues),
+    createdAt: row.created_at,
+    resolvedAt: row.resolved_at,
+    selectedIssue: row.selected_issue,
+  };
 }

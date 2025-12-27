@@ -10,6 +10,15 @@ const WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const DEFAULT_CHANNEL_ID = process.env.DISCORD_DEFAULT_CHANNEL_ID || "1453129264118370434";
 const AGENT_NAME = process.env.AGENT_NAME || "Claude Agent";
 
+// Generate avatar URL from agent name using DiceBear bottts style (PNG for Discord compatibility)
+const generateAvatarUrl = (agentName: string): string => {
+  // Convert agent name to a seed by removing spaces and special characters
+  const seed = agentName.replace(/[^a-zA-Z0-9]/g, '');
+  return `https://api.dicebear.com/9.x/bottts/png?seed=${seed}`;
+};
+
+const AVATAR_URL = generateAvatarUrl(AGENT_NAME);
+
 if (!WEBHOOK_URL) {
   console.error("DISCORD_WEBHOOK_URL environment variable is required");
   process.exit(1);
@@ -62,27 +71,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     const { category, message } = args;
 
-    const categoryConfig: Record<string, { emoji: string; color: number; label: string }> = {
-      tech_debt: { emoji: "🔧", color: 16744192, label: "Tech Debt" },
-      progress: { emoji: "✅", color: 3066993, label: "Progress Update" },
-      delay: { emoji: "⏳", color: 16776960, label: "Delay/Blocker" },
-      thinking: { emoji: "💭", color: 5814783, label: "Thinking" },
+    // Simple emoji prefixes for each category - keeps it casual like Slack
+    const categoryEmoji: Record<string, string> = {
+      tech_debt: "🔧",
+      progress: "✅",
+      delay: "⏳",
+      thinking: "💭",
     };
 
-    const config = categoryConfig[category] || categoryConfig.progress;
+    const emoji = categoryEmoji[category] || "";
 
+    // Plain text message, no embeds - looks like a normal Slack message
     const payload = {
-      embeds: [
-        {
-          title: `${config.emoji} ${config.label}`,
-          description: message,
-          color: config.color,
-          timestamp: new Date().toISOString(),
-          footer: {
-            text: AGENT_NAME,
-          },
-        },
-      ],
+      content: `${emoji} ${message}`,
+      username: AGENT_NAME,
+      avatar_url: AVATAR_URL,
     };
 
     try {

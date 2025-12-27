@@ -1,0 +1,382 @@
+# Onboarding Documentation Generator
+# Automatically updates documentation when project structure changes
+# See: docs/automation/onboarding-docs.md
+
+name: Onboarding Documentation Generator
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Structural changes that may need documentation updates
+      - "backend/src/**/Program.cs"
+      - "backend/src/**/Startup.cs"
+      - "backend/src/**/*.csproj"
+      - "webapp/package.json"
+      - "frontend/package.json"
+      - "infrastructure/**/*.ts"
+      - "infrastructure/**/*.yml"
+      - "docker-compose*.yml"
+      - "tools/**/package.json"
+      - "shared/**/*"
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: "Force documentation update even if no structural changes"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # ============================================================================
+  # Detect structural changes
+  # ============================================================================
+  detect-changes:
+    name: Detect Structural Changes
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.check.outputs.has_changes }}
+      change_type: ${{ steps.check.outputs.change_type }}
+      changed_areas: ${{ steps.check.outputs.areas }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 10
+
+      - name: Check for structural changes
+        id: check
+        run: |
+          set -euo pipefail
+
+          if [ "${{ inputs.force_update }}" == "true" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "change_type=forced" >> "$GITHUB_OUTPUT"
+            echo "areas=all" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Get changed files in this push
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git diff --name-only HEAD)
+
+          # Categorize changes
+          AREAS=""
+
+          if echo "$CHANGED_FILES" | grep -qE '^backend/'; then
+            AREAS="$AREAS backend"
+          fi
+
+          if echo "$CHANGED_FILES" | grep -qE '^(webapp|frontend)/'; then
+            AREAS="$AREAS frontend"
+          fi
+
+          if echo "$CHANGED_FILES" | grep -qE '^infrastructure/'; then
+            AREAS="$AREAS infrastructure"
+          fi
+
+          if echo "$CHANGED_FILES" | grep -qE '^tools/'; then
+            AREAS="$AREAS tools"
+          fi
+
+          if echo "$CHANGED_FILES" | grep -qE '^shared/'; then
+            AREAS="$AREAS shared"
+          fi
+
+          if echo "$CHANGED_FILES" | grep -qE 'docker-compose'; then
+            AREAS="$AREAS docker"
+          fi
+
+          if [ -n "$AREAS" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "change_type=structural" >> "$GITHUB_OUTPUT"
+            echo "areas=$AREAS" >> "$GITHUB_OUTPUT"
+            echo "Structural changes detected in:$AREAS"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "change_type=none" >> "$GITHUB_OUTPUT"
+            echo "areas=" >> "$GITHUB_OUTPUT"
+            echo "No structural changes detected"
+          fi
+
+  # ============================================================================
+  # Generate documentation updates
+  # ============================================================================
+  generate-updates:
+    name: Generate Documentation Updates
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.branch.outputs.name }}
+      has_updates: ${{ steps.commit.outputs.has_updates }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          fetch-depth: 50
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create update branch
+        id: branch
+        run: |
+          BRANCH="docs/onboarding-update-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH"
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Collect project structure
+        id: structure
+        run: |
+          set -euo pipefail
+
+          # Get directory tree (limited depth)
+          TREE=$(find . -maxdepth 3 -type d \
+            -not -path '*/node_modules/*' \
+            -not -path '*/.git/*' \
+            -not -path '*/dist/*' \
+            -not -path '*/bin/*' \
+            -not -path '*/obj/*' \
+            -not -path '*/.next/*' \
+            -not -path '*/cdk.out*' \
+            | sort)
+
+          # Get package.json files for dependency info
+          PACKAGES=$(find . -name 'package.json' -not -path '*/node_modules/*' | head -10)
+          PACKAGE_DEPS=""
+          for pkg in $PACKAGES; do
+            if [ -f "$pkg" ]; then
+              DEPS=$(jq -r '.dependencies // {} | keys | join(", ")' "$pkg" 2>/dev/null || echo "N/A")
+              PACKAGE_DEPS="${PACKAGE_DEPS}${pkg}: ${DEPS}; "
+            fi
+          done
+
+          # Get csproj files for .NET deps
+          CSPROJS=$(find . -name '*.csproj' | head -10)
+          CSPROJ_DEPS=""
+          for csproj in $CSPROJS; do
+            if [ -f "$csproj" ]; then
+              DEPS=$(grep -oP 'Include="\K[^"]+' "$csproj" 2>/dev/null | head -10 | tr '\n' ', ' || echo "N/A")
+              CSPROJ_DEPS="${CSPROJ_DEPS}${csproj}: ${DEPS}; "
+            fi
+          done
+
+          # Store outputs
+          DELIM="EOF_$(openssl rand -hex 8)"
+
+          echo "tree<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$TREE" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+          echo "npm_deps<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$PACKAGE_DEPS" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+          echo "dotnet_deps<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$CSPROJ_DEPS" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+      - name: Read existing docs
+        id: existing
+        run: |
+          set -euo pipefail
+
+          DELIM="EOF_$(openssl rand -hex 8)"
+
+          # Read README
+          if [ -f "README.md" ]; then
+            echo "readme<<$DELIM" >> "$GITHUB_OUTPUT"
+            cat README.md >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_OUTPUT"
+            echo "$DELIM" >> "$GITHUB_OUTPUT"
+          else
+            echo "readme=" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Read ABOUT
+          if [ -f "ABOUT.md" ]; then
+            echo "about<<$DELIM" >> "$GITHUB_OUTPUT"
+            cat ABOUT.md >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_OUTPUT"
+            echo "$DELIM" >> "$GITHUB_OUTPUT"
+          else
+            echo "about=" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Read ARCHITECTURE
+          if [ -f "docs/ARCHITECTURE.md" ]; then
+            echo "architecture<<$DELIM" >> "$GITHUB_OUTPUT"
+            cat docs/ARCHITECTURE.md >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_OUTPUT"
+            echo "$DELIM" >> "$GITHUB_OUTPUT"
+          else
+            echo "architecture=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build MCP Discord tool
+        run: |
+          cd tools/mcp-discord
+          npm ci
+          npm run build
+
+      - name: Create MCP config
+        run: |
+          mkdir -p ~/.config
+          cat > ~/.config/mcp.json << 'EOF'
+          {
+            "mcpServers": {
+              "mcp-discord": {
+                "command": "node",
+                "args": ["${{ github.workspace }}/tools/mcp-discord/dist/index.js"],
+                "env": {
+                  "DISCORD_DEV_WEBHOOK_URL": "${{ secrets.DISCORD_DEV_WEBHOOK_URL }}"
+                }
+              }
+            }
+          }
+          EOF
+
+      - name: Generate documentation updates
+        uses: anthropics/claude-code-action@v1
+        with:
+          github_token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --model claude-opus-4-5-20251101
+            --max-turns 10
+          prompt: |
+            You are the Onboarding Documentation Generator. Update documentation to reflect current project structure.
+
+            ## Changed Areas
+            ${{ needs.detect-changes.outputs.changed_areas }}
+
+            ## Current Project Structure
+            ${{ steps.structure.outputs.tree }}
+
+            ## NPM Dependencies
+            ${{ steps.structure.outputs.npm_deps }}
+
+            ## .NET Dependencies
+            ${{ steps.structure.outputs.dotnet_deps }}
+
+            ## Existing README.md
+            ${{ steps.existing.outputs.readme }}
+
+            ## Existing ABOUT.md
+            ${{ steps.existing.outputs.about }}
+
+            ## Existing docs/ARCHITECTURE.md
+            ${{ steps.existing.outputs.architecture }}
+
+            ## Your Task
+
+            1. Review the current project structure and dependencies
+            2. Compare with existing documentation
+            3. Update documentation files to reflect current state:
+               - README.md: Update getting started, project structure, quick start commands
+               - ABOUT.md: Update technical overview if needed
+               - docs/ARCHITECTURE.md: Update architecture diagrams and component descriptions
+
+            Rules:
+            - Only update sections that are outdated
+            - Preserve existing style and tone
+            - Keep changes minimal and focused
+            - Add comments for new sections
+            - Ensure all commands in docs actually work
+
+            If no updates are needed, say so and don't make any changes.
+
+      - name: Check for changes
+        id: commit
+        run: |
+          if git diff --quiet; then
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+            echo "No documentation updates needed"
+          else
+            echo "has_updates=true" >> "$GITHUB_OUTPUT"
+            git add -A
+            git commit -m "docs: update onboarding documentation
+
+            Auto-generated documentation updates based on structural changes.
+            
+            Changed areas: ${{ needs.detect-changes.outputs.changed_areas }}"
+            git push -u origin "${{ steps.branch.outputs.name }}"
+            echo "Documentation updates committed"
+          fi
+
+  # ============================================================================
+  # Create PR for review
+  # ============================================================================
+  create-pr:
+    name: Create Pull Request
+    needs: [detect-changes, generate-updates]
+    if: needs.generate-updates.outputs.has_updates == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const branch = '${{ needs.generate-updates.outputs.branch }}';
+            const areas = '${{ needs.detect-changes.outputs.changed_areas }}';
+
+            // Check if PR already exists
+            const { data: existingPRs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${branch}`,
+              state: 'open'
+            });
+
+            if (existingPRs.length > 0) {
+              console.log(`PR already exists for branch ${branch}`);
+              return;
+            }
+
+            const changedAreas = areas.split(' ').filter(a => a).map(a => `- ${a}`).join('\n');
+            const separator = '---';
+            const body = `## Documentation Update\n\nThis PR updates onboarding documentation based on recent structural changes.\n\n### Changed Areas\n${changedAreas}\n\n### Files Updated\nDocumentation files have been updated to reflect the current project structure.\n\n${separator}\n\n*Automatically generated by Onboarding Documentation Generator*`;
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'docs: update onboarding documentation',
+              body: body,
+              head: branch,
+              base: 'main',
+              labels: ['documentation', 'automated']
+            });
+
+            console.log(`Created PR #${pr.number}: ${pr.html_url}`);
+
+  # ============================================================================
+  # Notify on updates
+  # ============================================================================
+  notify-updates:
+    name: Notify Documentation Updates
+    needs: [detect-changes, generate-updates, create-pr]
+    if: needs.generate-updates.outputs.has_updates == 'true'
+    uses: ./.github/workflows/discord-gpt-message.yml
+    with:
+      webhook_username: "Riley - Docs"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=RileyDocs"
+      prompt: |
+        📝 onboarding docs updated based on recent changes to: ${{ needs.detect-changes.outputs.changed_areas }}
+
+        PR created for review - check it out when you have a moment
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}

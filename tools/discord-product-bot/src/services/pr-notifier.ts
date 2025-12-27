@@ -26,9 +26,14 @@ export async function notifyPrReady(
   trackedIssue: TrackedIssue,
   prNumber: number
 ): Promise<void> {
+  // Disabled: PR notifications now handled by GitHub workflow
+  console.log(`[PRNotifier] Skipping PR ready notification for #${prNumber} (handled by workflow)`);
+  markPrAnnounced(trackedIssue.issueNumber);
+  return;
+
   try {
     const channel = await client.channels.fetch(config.discord.pullRequestsChannelId);
-    if (!channel || !channel.isTextBased()) {
+    if (!channel?.isTextBased()) {
       console.error('[PRNotifier] Pull requests channel not found or not text-based');
       return;
     }

@@ -23,16 +23,28 @@ const openai = new OpenAI({
 
 const MAX_ITERATIONS = 10;
 
-async function getAdditionalContext(): Promise<string | undefined> {
+async function getAdditionalContext(context: MessageContext): Promise<string | undefined> {
+  const contextParts: string[] = [];
+
+  // Add milestone context
   try {
     const milestone = await team_get_active_milestone();
     if (milestone) {
-      return `Active milestone: ${milestone}`;
+      contextParts.push(`Active milestone: ${milestone}`);
     }
   } catch (error) {
     console.error('Failed to load additional context:', error);
   }
-  return undefined;
+
+  // Add thread creation context - instructs agent to consolidate response
+  if (context.isThreadCreation) {
+    contextParts.push(
+      '**THREAD CREATION MODE**: This is a newly created thread. You MUST send exactly ONE message. ' +
+      'The anchor message has already been sent. Consolidate your entire response (questions, summary, or issue creation) into a single message.'
+    );
+  }
+
+  return contextParts.length > 0 ? contextParts.join('\n\n') : undefined;
 }
 
 export interface AgentResult {
@@ -107,7 +119,7 @@ export async function runAgent(
   const messages: ChatCompletionMessageParam[] = [
     {
       role: 'system',
-      content: buildSystemPrompt(await getAdditionalContext()),
+      content: buildSystemPrompt(await getAdditionalContext(context)),
     },
     ...historyMessages,
     {

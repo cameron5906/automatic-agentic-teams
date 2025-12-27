@@ -1,0 +1,983 @@
+name: Fix Review Feedback
+
+# Triggers when a PR review requests changes (from AI or human reviewer)
+# Can also be triggered manually for a specific PR/review
+on:
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to process"
+        required: true
+        type: string
+      review_id:
+        description: "Specific review ID (optional - defaults to latest changes_requested review)"
+        required: false
+        type: string
+      skip_review_check:
+        description: "Skip the changes_requested review check (for testing)"
+        required: false
+        type: boolean
+        default: false
+      use_pr_comments:
+        description: "Use PR comments instead of formal review (backwards compat for pre-fix PRs)"
+        required: false
+        type: boolean
+        default: false
+
+# Prevent concurrent fix runs on the same PR
+concurrency:
+  group: fix-pr-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  # ==========================================================================
+  # STAGE 1: EXTRACT CONTEXT FROM PR
+  # ==========================================================================
+  extract-context:
+    name: Extract Context
+    runs-on: ubuntu-latest
+    # Run if: (1) automatic trigger with changes_requested, or (2) manual trigger
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.review.state == 'changes_requested'
+    outputs:
+      issue_number: ${{ steps.parse.outputs.issue_number }}
+      work_branch: ${{ steps.parse.outputs.work_branch }}
+      review_comments: ${{ steps.review.outputs.comments }}
+      agent_prompts: ${{ steps.parse.outputs.agent_prompts }}
+      original_context: ${{ steps.parse.outputs.original_context }}
+      iteration: ${{ steps.iteration.outputs.current }}
+      should_continue: ${{ steps.iteration.outputs.should_continue }}
+      reviewer: ${{ steps.review.outputs.reviewer }}
+      pr_number: ${{ steps.parse.outputs.pr_number }}
+    steps:
+      - name: Parse PR for issue number and agent prompts
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Determine PR number from event or manual input
+            let prNumber;
+            let pr;
+
+            if (context.eventName === 'workflow_dispatch') {
+              // Manual trigger - fetch PR data via API
+              prNumber = parseInt('${{ inputs.pr_number }}');
+              const { data: prData } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber
+              });
+              pr = prData;
+              console.log(`Manual trigger for PR #${prNumber}`);
+            } else {
+              // Automatic trigger - use event payload
+              pr = context.payload.pull_request;
+              prNumber = pr.number;
+              console.log(`Automatic trigger for PR #${prNumber}`);
+            }
+
+            const body = pr.body || '';
+            const title = pr.title || '';
+
+            // Extract issue number from title "[Auto] Resolves #N" or body "Closes #N"
+            let issueNumber = null;
+            const titleMatch = title.match(/Resolves #(\d+)/i);
+            const bodyMatch = body.match(/Closes #(\d+)/i);
+            issueNumber = titleMatch?.[1] || bodyMatch?.[1];
+
+            if (!issueNumber) {
+              core.setFailed('Could not extract issue number from PR title or body');
+              return;
+            }
+
+            // Extract agent_prompts JSON from PR body (embedded as HTML comment)
+            let agentPrompts = '{}';
+            const promptsMatch = body.match(/<!-- AGENT_PROMPTS_JSON\n([\s\S]*?)\n-->/);
+            if (promptsMatch) {
+              agentPrompts = promptsMatch[1].trim();
+            }
+
+            // Extract original issue context from PR body
+            let originalContext = '';
+            const contextMatch = body.match(/### Issue Context\n([\s\S]*?)(?:\n\n|$)/);
+            if (contextMatch) {
+              originalContext = contextMatch[1].trim();
+            }
+
+            core.setOutput('issue_number', issueNumber);
+            core.setOutput('work_branch', pr.head.ref);
+            core.setOutput('agent_prompts', agentPrompts);
+            core.setOutput('original_context', originalContext);
+            core.setOutput('pr_number', prNumber.toString());
+            core.setOutput('pr_labels', JSON.stringify(pr.labels.map(l => l.name)));
+
+            console.log(`Issue: #${issueNumber}`);
+            console.log(`Branch: ${pr.head.ref}`);
+
+      - name: Fetch review comments
+        id: review
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt('${{ steps.parse.outputs.pr_number }}');
+            const usePrComments = '${{ inputs.use_pr_comments }}' === 'true';
+            let review;
+            let reviewer;
+            let comments = [];
+
+            if (context.eventName === 'workflow_dispatch' && usePrComments) {
+              // Backwards compat: Use PR issue comments instead of formal reviews
+              console.log('USE_PR_COMMENTS mode: Fetching PR issue comments instead of reviews');
+              
+              const { data: issueComments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber
+              });
+              
+              // Filter to comments that look like review feedback (contain blocking issues, etc.)
+              // Sort by most recent first
+              const sortedComments = issueComments
+                .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+              
+              if (sortedComments.length === 0) {
+                core.setFailed('No PR comments found for this PR');
+                return;
+              }
+              
+              // Use the most recent comment as the review feedback
+              const latestComment = sortedComments[0];
+              reviewer = latestComment.user.login;
+              
+              comments.push({
+                type: 'pr_comment',
+                body: latestComment.body
+              });
+              
+              // Create a synthetic review object for downstream compatibility
+              review = {
+                id: latestComment.id,
+                body: latestComment.body,
+                user: latestComment.user
+              };
+              
+              console.log(`Using PR comment from ${reviewer} (ID: ${latestComment.id})`);
+              
+            } else if (context.eventName === 'workflow_dispatch') {
+              // Manual trigger - fetch review from API
+              const inputReviewId = '${{ inputs.review_id }}';
+              
+              if (inputReviewId) {
+                // Specific review ID provided
+                const { data: reviewData } = await github.rest.pulls.getReview({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber,
+                  review_id: parseInt(inputReviewId)
+                });
+                review = reviewData;
+                console.log(`Using specified review ID: ${inputReviewId}`);
+              } else {
+                // Find the latest changes_requested review
+                const { data: reviews } = await github.rest.pulls.listReviews({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber
+                });
+                
+                // Filter to changes_requested and get the most recent
+                const changesRequested = reviews
+                  .filter(r => r.state === 'CHANGES_REQUESTED')
+                  .sort((a, b) => new Date(b.submitted_at) - new Date(a.submitted_at));
+                
+                if (changesRequested.length === 0) {
+                  const skipCheck = '${{ inputs.skip_review_check }}' === 'true';
+                  if (skipCheck) {
+                    // For testing: use the latest review of any state
+                    const allReviews = reviews.sort((a, b) => new Date(b.submitted_at) - new Date(a.submitted_at));
+                    if (allReviews.length === 0) {
+                      core.setFailed('No reviews found for this PR');
+                      return;
+                    }
+                    review = allReviews[0];
+                    console.log(`SKIP_REVIEW_CHECK: Using latest review (state: ${review.state}, ID: ${review.id})`);
+                  } else {
+                    core.setFailed('No changes_requested review found for this PR');
+                    return;
+                  }
+                } else {
+                  review = changesRequested[0];
+                  console.log(`Using latest changes_requested review ID: ${review.id}`);
+                }
+              }
+              
+              reviewer = review.user.login;
+              
+              // Add the review body if present
+              if (review.body) {
+                comments.push({
+                  type: 'review_body',
+                  body: review.body
+                });
+              }
+            } else {
+              // Automatic trigger - use event payload
+              review = context.payload.review;
+              reviewer = context.payload.review.user.login;
+              
+              // Add the review body if present
+              if (review.body) {
+                comments.push({
+                  type: 'review_body',
+                  body: review.body
+                });
+              }
+            }
+
+            // Fetch review comments (line-level comments) - skip for PR comments mode
+            if (!usePrComments) {
+              const { data: reviewComments } = await github.rest.pulls.listReviewComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber
+              });
+
+              // Filter to comments from this review
+              for (const comment of reviewComments) {
+                if (comment.pull_request_review_id === review.id) {
+                  comments.push({
+                    type: 'line_comment',
+                    path: comment.path,
+                    line: comment.line || comment.original_line,
+                    body: comment.body
+                  });
+                }
+              }
+            }
+
+            // Format comments for agent consumption
+            const formatted = comments.map(c => {
+              if (c.type === 'review_body') {
+                return `Review Comment: ${c.body}`;
+              } else if (c.type === 'pr_comment') {
+                return `PR Comment: ${c.body}`;
+              } else {
+                return `File: ${c.path}:${c.line} - ${c.body}`;
+              }
+            }).join('\n');
+
+            core.setOutput('comments', formatted);
+            core.setOutput('reviewer', reviewer);
+            console.log(`Reviewer: ${reviewer}`);
+            console.log(`Found ${comments.length} review comments`);
+
+      - name: Check iteration count from labels
+        id: iteration
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Get labels from previous step output (works for both triggers)
+            const labelsJson = '${{ steps.parse.outputs.pr_labels }}';
+            const labels = JSON.parse(labelsJson || '[]');
+
+            // Check for existing iteration labels
+            let currentIteration = 0;
+            for (const label of labels) {
+              const match = label.match(/^fix-iteration-(\d+)$/);
+              if (match) {
+                currentIteration = Math.max(currentIteration, parseInt(match[1]));
+              }
+            }
+
+            // Next iteration will be current + 1
+            const nextIteration = currentIteration + 1;
+            const shouldContinue = nextIteration <= 3;
+
+            core.setOutput('current', nextIteration.toString());
+            core.setOutput('should_continue', shouldContinue.toString());
+
+            console.log(`Current iteration: ${nextIteration}/3`);
+            console.log(`Should continue: ${shouldContinue}`);
+
+      - name: Add fix-in-progress label
+        if: steps.iteration.outputs.should_continue == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Add fix-in-progress label to prevent concurrent fix attempts
+            const prNumber = parseInt('${{ steps.parse.outputs.pr_number }}');
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              labels: ['fix-in-progress']
+            });
+
+            console.log(`Added fix-in-progress label to PR #${prNumber}`);
+
+  # ==========================================================================
+  # STAGE 2: CHECK ITERATION LIMIT
+  # ==========================================================================
+  check-iteration-limit:
+    name: Check Iteration Limit
+    needs: [extract-context]
+    runs-on: ubuntu-latest
+    if: needs.extract-context.outputs.should_continue == 'false'
+    steps:
+      - name: Add needs-human-review label and comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt('${{ needs.extract-context.outputs.pr_number }}');
+
+            // Remove fix-in-progress label if it exists
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                name: 'fix-in-progress'
+              });
+              console.log('Removed fix-in-progress label');
+            } catch (e) {
+              console.log('fix-in-progress label not found');
+            }
+
+            // Add needs-human-review label
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              labels: ['needs-human-review']
+            });
+
+            // Add comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `## 🛑 Automated Fix Limit Reached\n\nThis PR has gone through **3 fix iterations** without passing code review.\n\n**Human intervention required.** Please review the feedback and make manual fixes, or close this PR and create a new issue with more specific requirements.`
+            });
+
+            console.log('Added needs-human-review label and comment');
+
+  # Notify team lead when manual intervention is required
+  notify-human-review:
+    name: Notify Human Review Required
+    needs: [extract-context, check-iteration-limit]
+    if: needs.check-iteration-limit.result == 'success'
+    uses: ./.github/workflows/discord-gpt-message.yml
+    with:
+      webhook_username: "Avery - Review"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=AveryReview"
+      prompt: |
+        <@${{ vars.DISCORD_TEAM_LEAD_USER_ID }}> PR #${{ needs.extract-context.outputs.pr_number }} needs your attention
+
+        automated fixes have been attempted 3 times without success - manual review required
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_PR_WEBHOOK_URL }}
+
+  # ==========================================================================
+  # STAGE 3: GENERATE FIX CONTEXT (GPT-4o)
+  # ==========================================================================
+  generate-fix-context:
+    name: Generate Fix Context
+    needs: [extract-context]
+    if: needs.extract-context.outputs.should_continue == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      fix_context: ${{ steps.generate.outputs.fix_context }}
+    steps:
+      - name: Generate fix-scoped issue context (GPT-4o)
+        id: generate
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ORIGINAL_CONTEXT: ${{ needs.extract-context.outputs.original_context }}
+          REVIEW_COMMENTS: ${{ needs.extract-context.outputs.review_comments }}
+          ITERATION: ${{ needs.extract-context.outputs.iteration }}
+        run: |
+          set -euo pipefail
+
+          # Build the prompt
+          SYSTEM_PROMPT="You generate a concise issue context for fixing code review feedback. Output only the context string, no JSON wrapping."
+
+          USER_PROMPT=$(cat <<EOF
+          ## Original Issue Context
+          ${ORIGINAL_CONTEXT}
+
+          ## Review Feedback to Address (Iteration ${ITERATION}/3)
+          ${REVIEW_COMMENTS}
+
+          ## Task
+          Generate a focused issue_context string (max 500 chars) that:
+          1. Summarizes what needs to be fixed based on the review feedback
+          2. References the specific files/lines mentioned in the review
+          3. Keeps scope narrow to ONLY the review feedback
+          4. Mentions this is fix iteration ${ITERATION}/3
+
+          Output ONLY the context string, nothing else.
+          EOF
+          )
+
+          # Build request payload
+          jq -n \
+            --arg model "gpt-4o-2024-08-06" \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg user "$USER_PROMPT" \
+            '{
+              model: $model,
+              temperature: 0.3,
+              max_tokens: 300,
+              messages: [
+                { role: "system", content: $system },
+                { role: "user", content: $user }
+              ]
+            }' > /tmp/context_request.json
+
+          # Call OpenAI
+          curl -sS https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -d @/tmp/context_request.json \
+            > /tmp/context_response.json
+
+          # Extract response
+          FIX_CONTEXT=$(jq -r '.choices[0].message.content // empty' /tmp/context_response.json)
+
+          if [ -z "$FIX_CONTEXT" ]; then
+            echo "Failed to generate fix context"
+            jq . /tmp/context_response.json
+            exit 1
+          fi
+
+          echo "fix_context<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$FIX_CONTEXT" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "Generated fix context: $FIX_CONTEXT"
+
+  # ==========================================================================
+  # STAGE 4: ANALYZE FEEDBACK AND SELECT AGENTS (GPT-4o)
+  # ==========================================================================
+  analyze-feedback:
+    name: Analyze Feedback
+    needs: [extract-context, generate-fix-context]
+    if: needs.extract-context.outputs.should_continue == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      activate_software_engineer: ${{ steps.parse.outputs.activate_software_engineer }}
+      activate_test_engineer: ${{ steps.parse.outputs.activate_test_engineer }}
+      activate_infrastructure_engineer: ${{ steps.parse.outputs.activate_infrastructure_engineer }}
+      activate_security_engineer: ${{ steps.parse.outputs.activate_security_engineer }}
+      activate_documentation_sheriff: ${{ steps.parse.outputs.activate_documentation_sheriff }}
+      summary: ${{ steps.parse.outputs.summary }}
+    steps:
+      - name: Analyze feedback and select agents (GPT-4o)
+        id: analyze
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REVIEW_COMMENTS: ${{ needs.extract-context.outputs.review_comments }}
+        run: |
+          set -euo pipefail
+
+          # Define the output schema
+          cat > /tmp/agent_selection_schema.json <<'JSON'
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["agents_to_activate", "summary", "blocking_issues_count"],
+            "properties": {
+              "agents_to_activate": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["software_engineer", "test_engineer", "infrastructure_engineer", "security_engineer", "documentation_sheriff"],
+                "properties": {
+                  "software_engineer": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["activate", "reason"],
+                    "properties": {
+                      "activate": { "type": "boolean" },
+                      "reason": { "type": "string" }
+                    }
+                  },
+                  "test_engineer": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["activate", "reason"],
+                    "properties": {
+                      "activate": { "type": "boolean" },
+                      "reason": { "type": "string" }
+                    }
+                  },
+                  "infrastructure_engineer": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["activate", "reason"],
+                    "properties": {
+                      "activate": { "type": "boolean" },
+                      "reason": { "type": "string" }
+                    }
+                  },
+                  "security_engineer": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["activate", "reason"],
+                    "properties": {
+                      "activate": { "type": "boolean" },
+                      "reason": { "type": "string" }
+                    }
+                  },
+                  "documentation_sheriff": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["activate", "reason"],
+                    "properties": {
+                      "activate": { "type": "boolean" },
+                      "reason": { "type": "string" }
+                    }
+                  }
+                }
+              },
+              "summary": { "type": "string" },
+              "blocking_issues_count": { "type": "integer" }
+            }
+          }
+          JSON
+
+          SCHEMA_JSON="$(jq -c . /tmp/agent_selection_schema.json)"
+
+          SYSTEM_PROMPT="You analyze code review feedback and determine which agents should be activated to fix the issues."
+
+          USER_PROMPT=$(cat <<EOF
+          ## Review Feedback
+          ${REVIEW_COMMENTS}
+
+          ## Available Agents
+          - software_engineer: Fixes code issues, implements changes
+          - test_engineer: Adds or fixes tests
+          - infrastructure_engineer: Fixes infrastructure/CDK/Docker issues
+          - security_engineer: Fixes security vulnerabilities
+          - documentation_sheriff: Fixes documentation issues
+
+          ## Task
+          Analyze the review feedback and determine which agents should be activated.
+          Only activate agents that are DIRECTLY needed to address the feedback.
+          For each agent, provide a brief reason if activated.
+          EOF
+          )
+
+          # Build request payload with structured output
+          jq -n \
+            --arg model "gpt-4o-2024-08-06" \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg user "$USER_PROMPT" \
+            --argjson schema "$SCHEMA_JSON" \
+            '{
+              model: $model,
+              temperature: 0,
+              max_tokens: 1000,
+              response_format: {
+                type: "json_schema",
+                json_schema: {
+                  name: "agent_selection",
+                  strict: true,
+                  schema: $schema
+                }
+              },
+              messages: [
+                { role: "system", content: $system },
+                { role: "user", content: $user }
+              ]
+            }' > /tmp/analyze_request.json
+
+          # Call OpenAI
+          curl -sS https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -d @/tmp/analyze_request.json \
+            > /tmp/analyze_response.json
+
+          # Extract response
+          RESULT=$(jq -r '.choices[0].message.content // empty' /tmp/analyze_response.json)
+
+          if [ -z "$RESULT" ]; then
+            echo "Failed to analyze feedback"
+            jq . /tmp/analyze_response.json
+            exit 1
+          fi
+
+          echo "$RESULT" > /tmp/agent_selection.json
+          echo "result<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$RESULT" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Parse agent selection
+        id: parse
+        run: |
+          set -euo pipefail
+
+          RESULT='${{ steps.analyze.outputs.result }}'
+
+          # Parse each agent activation
+          SW=$(echo "$RESULT" | jq -r '.agents_to_activate.software_engineer.activate')
+          TE=$(echo "$RESULT" | jq -r '.agents_to_activate.test_engineer.activate')
+          IE=$(echo "$RESULT" | jq -r '.agents_to_activate.infrastructure_engineer.activate')
+          SE=$(echo "$RESULT" | jq -r '.agents_to_activate.security_engineer.activate')
+          DS=$(echo "$RESULT" | jq -r '.agents_to_activate.documentation_sheriff.activate')
+          SUMMARY=$(echo "$RESULT" | jq -r '.summary')
+
+          echo "activate_software_engineer=$SW" >> "$GITHUB_OUTPUT"
+          echo "activate_test_engineer=$TE" >> "$GITHUB_OUTPUT"
+          echo "activate_infrastructure_engineer=$IE" >> "$GITHUB_OUTPUT"
+          echo "activate_security_engineer=$SE" >> "$GITHUB_OUTPUT"
+          echo "activate_documentation_sheriff=$DS" >> "$GITHUB_OUTPUT"
+          echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
+
+          echo "Agent selection:"
+          echo "  software_engineer: $SW"
+          echo "  test_engineer: $TE"
+          echo "  infrastructure_engineer: $IE"
+          echo "  security_engineer: $SE"
+          echo "  documentation_sheriff: $DS"
+
+  # ==========================================================================
+  # STAGE 5: DISCORD NOTIFICATION (Pre-fix)
+  # ==========================================================================
+  notify-fix-start:
+    name: Notify - Fix Starting
+    needs: [extract-context, analyze-feedback]
+    if: needs.extract-context.outputs.should_continue == 'true'
+    uses: ./.github/workflows/discord-gpt-message.yml
+    with:
+      webhook_username: "Avery - Review"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=AveryReview"
+      prompt: |
+        addressing review feedback on PR #${{ needs.extract-context.outputs.pr_number }} (iteration ${{ needs.extract-context.outputs.iteration }}/3)
+
+        reviewer: ${{ needs.extract-context.outputs.reviewer }}
+        issue: #${{ needs.extract-context.outputs.issue_number }}
+        summary: ${{ needs.analyze-feedback.outputs.summary }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ==========================================================================
+  # STAGE 6: FIX AGENTS
+  # ==========================================================================
+  fix-software-engineer:
+    name: Software Engineer (Fix)
+    needs: [extract-context, generate-fix-context, analyze-feedback]
+    if: |
+      needs.extract-context.outputs.should_continue == 'true' &&
+      needs.analyze-feedback.outputs.activate_software_engineer == 'true'
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: software-engineer
+      phase: fix
+      issue_number: ${{ needs.extract-context.outputs.issue_number }}
+      issue_context: ${{ needs.generate-fix-context.outputs.fix_context }}
+      agent_prompts: ${{ needs.extract-context.outputs.agent_prompts }}
+      work_branch: ${{ needs.extract-context.outputs.work_branch }}
+      review_feedback: ${{ needs.extract-context.outputs.review_comments }}
+      fix_iteration: ${{ needs.extract-context.outputs.iteration }}
+    secrets: inherit
+
+  fix-test-engineer:
+    name: Test Engineer (Fix)
+    needs:
+      [
+        extract-context,
+        generate-fix-context,
+        analyze-feedback,
+        fix-software-engineer,
+      ]
+    if: |
+      always() &&
+      needs.extract-context.outputs.should_continue == 'true' &&
+      needs.analyze-feedback.outputs.activate_test_engineer == 'true' &&
+      (needs.fix-software-engineer.result == 'success' || needs.fix-software-engineer.result == 'skipped')
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: test-engineer
+      phase: fix
+      issue_number: ${{ needs.extract-context.outputs.issue_number }}
+      issue_context: ${{ needs.generate-fix-context.outputs.fix_context }}
+      agent_prompts: ${{ needs.extract-context.outputs.agent_prompts }}
+      work_branch: ${{ needs.extract-context.outputs.work_branch }}
+      review_feedback: ${{ needs.extract-context.outputs.review_comments }}
+      fix_iteration: ${{ needs.extract-context.outputs.iteration }}
+    secrets: inherit
+
+  fix-infrastructure-engineer:
+    name: Infrastructure Engineer (Fix)
+    needs:
+      [
+        extract-context,
+        generate-fix-context,
+        analyze-feedback,
+        fix-software-engineer,
+      ]
+    if: |
+      always() &&
+      needs.extract-context.outputs.should_continue == 'true' &&
+      needs.analyze-feedback.outputs.activate_infrastructure_engineer == 'true' &&
+      (needs.fix-software-engineer.result == 'success' || needs.fix-software-engineer.result == 'skipped')
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: infrastructure-engineer
+      phase: fix
+      issue_number: ${{ needs.extract-context.outputs.issue_number }}
+      issue_context: ${{ needs.generate-fix-context.outputs.fix_context }}
+      agent_prompts: ${{ needs.extract-context.outputs.agent_prompts }}
+      work_branch: ${{ needs.extract-context.outputs.work_branch }}
+      review_feedback: ${{ needs.extract-context.outputs.review_comments }}
+      fix_iteration: ${{ needs.extract-context.outputs.iteration }}
+    secrets: inherit
+
+  fix-security-engineer:
+    name: Security Engineer (Fix)
+    needs:
+      [
+        extract-context,
+        generate-fix-context,
+        analyze-feedback,
+        fix-software-engineer,
+      ]
+    if: |
+      always() &&
+      needs.extract-context.outputs.should_continue == 'true' &&
+      needs.analyze-feedback.outputs.activate_security_engineer == 'true' &&
+      (needs.fix-software-engineer.result == 'success' || needs.fix-software-engineer.result == 'skipped')
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: security-engineer
+      phase: fix
+      issue_number: ${{ needs.extract-context.outputs.issue_number }}
+      issue_context: ${{ needs.generate-fix-context.outputs.fix_context }}
+      agent_prompts: ${{ needs.extract-context.outputs.agent_prompts }}
+      work_branch: ${{ needs.extract-context.outputs.work_branch }}
+      review_feedback: ${{ needs.extract-context.outputs.review_comments }}
+      fix_iteration: ${{ needs.extract-context.outputs.iteration }}
+    secrets: inherit
+
+  fix-documentation-sheriff:
+    name: Documentation Sheriff (Fix)
+    needs:
+      [
+        extract-context,
+        generate-fix-context,
+        analyze-feedback,
+        fix-software-engineer,
+        fix-test-engineer,
+      ]
+    if: |
+      always() &&
+      needs.extract-context.outputs.should_continue == 'true' &&
+      needs.analyze-feedback.outputs.activate_documentation_sheriff == 'true' &&
+      (needs.fix-software-engineer.result == 'success' || needs.fix-software-engineer.result == 'skipped') &&
+      (needs.fix-test-engineer.result == 'success' || needs.fix-test-engineer.result == 'skipped')
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: documentation-sheriff
+      phase: fix
+      issue_number: ${{ needs.extract-context.outputs.issue_number }}
+      issue_context: ${{ needs.generate-fix-context.outputs.fix_context }}
+      agent_prompts: ${{ needs.extract-context.outputs.agent_prompts }}
+      work_branch: ${{ needs.extract-context.outputs.work_branch }}
+      review_feedback: ${{ needs.extract-context.outputs.review_comments }}
+      fix_iteration: ${{ needs.extract-context.outputs.iteration }}
+    secrets: inherit
+
+  # ==========================================================================
+  # STAGE 7: CODE REVIEWER RE-VALIDATION
+  # ==========================================================================
+  code-reviewer-revalidate:
+    name: Code Reviewer (Re-validate)
+    needs:
+      - extract-context
+      - generate-fix-context
+      - analyze-feedback
+      - fix-software-engineer
+      - fix-test-engineer
+      - fix-infrastructure-engineer
+      - fix-security-engineer
+      - fix-documentation-sheriff
+    if: |
+      always() &&
+      needs.extract-context.outputs.should_continue == 'true' &&
+      (needs.fix-software-engineer.result == 'success' || needs.fix-software-engineer.result == 'skipped') &&
+      (needs.fix-test-engineer.result == 'success' || needs.fix-test-engineer.result == 'skipped') &&
+      (needs.fix-infrastructure-engineer.result == 'success' || needs.fix-infrastructure-engineer.result == 'skipped') &&
+      (needs.fix-security-engineer.result == 'success' || needs.fix-security-engineer.result == 'skipped') &&
+      (needs.fix-documentation-sheriff.result == 'success' || needs.fix-documentation-sheriff.result == 'skipped')
+    uses: ./.github/workflows/agent-step.yml
+    with:
+      agent_name: code-reviewer
+      phase: fix
+      issue_number: ${{ needs.extract-context.outputs.issue_number }}
+      issue_context: ${{ needs.generate-fix-context.outputs.fix_context }}
+      agent_prompts: ${{ needs.extract-context.outputs.agent_prompts }}
+      pr_number: ${{ needs.extract-context.outputs.pr_number }}
+      work_branch: ${{ needs.extract-context.outputs.work_branch }}
+      review_feedback: ${{ needs.extract-context.outputs.review_comments }}
+      fix_iteration: ${{ needs.extract-context.outputs.iteration }}
+    secrets: inherit
+
+  # ==========================================================================
+  # STAGE 8: HANDLE REVIEW RESULT
+  # ==========================================================================
+  handle-review-result:
+    name: Handle Review Result
+    needs: [extract-context, code-reviewer-revalidate]
+    if: always() && needs.extract-context.outputs.should_continue == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Parse code reviewer result
+        id: parse
+        run: |
+          RESULT='${{ needs.code-reviewer-revalidate.outputs.result }}'
+
+          # Try to extract review_status from the result
+          if echo "$RESULT" | jq -e '.review_status' > /dev/null 2>&1; then
+            STATUS=$(echo "$RESULT" | jq -r '.review_status')
+          elif echo "$RESULT" | jq -e '.approved' > /dev/null 2>&1; then
+            APPROVED=$(echo "$RESULT" | jq -r '.approved')
+            if [ "$APPROVED" = "true" ]; then
+              STATUS="APPROVED"
+            else
+              STATUS="REJECTED"
+            fi
+          else
+            # Default to rejected if we can't parse
+            STATUS="REJECTED"
+          fi
+
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "Review status: $STATUS"
+
+      - name: Update iteration label on rejection
+        if: steps.parse.outputs.status == 'REJECTED'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt('${{ needs.extract-context.outputs.pr_number }}');
+            const currentIteration = parseInt('${{ needs.extract-context.outputs.iteration }}');
+
+            // Fetch current PR labels
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            // Remove old iteration labels
+            const labels = pr.labels.map(l => l.name);
+            for (const label of labels) {
+              if (label.match(/^fix-iteration-\d+$/)) {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  name: label
+                });
+              }
+            }
+
+            // Add new iteration label
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              labels: [`fix-iteration-${currentIteration}`]
+            });
+
+            console.log(`Updated label to fix-iteration-${currentIteration}`);
+
+      - name: Comment on approval and clean up labels
+        if: steps.parse.outputs.status == 'APPROVED'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt('${{ needs.extract-context.outputs.pr_number }}');
+
+            // Remove fix iteration labels on approval
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            for (const label of pr.labels) {
+              if (label.name.match(/^fix-iteration-\d+$/)) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber,
+                    name: label.name
+                  });
+                  console.log(`Removed ${label.name} label`);
+                } catch (e) {
+                  console.log(`Could not remove ${label.name}`);
+                }
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `## ✅ Review Feedback Addressed\n\nThe automated fix agents have addressed the review feedback and the code reviewer has approved the changes.\n\n**Iteration:** ${{ needs.extract-context.outputs.iteration }}/3\n\nThis PR is ready for final review and merge.`
+            });
+
+      - name: Remove fix-in-progress label
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Remove fix-in-progress label to allow new fix cycles if needed
+            const prNumber = parseInt('${{ needs.extract-context.outputs.pr_number }}');
+
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                name: 'fix-in-progress'
+              });
+              console.log(`Removed fix-in-progress label from PR #${prNumber}`);
+            } catch (e) {
+              // Label might not exist, which is fine
+              console.log('fix-in-progress label not found or already removed');
+            }
+
+  # ==========================================================================
+  # STAGE 9: DISCORD NOTIFICATION (Post-fix)
+  # ==========================================================================
+  notify-fix-complete:
+    name: Notify - Fix Complete
+    needs: [extract-context, handle-review-result]
+    if: always() && needs.extract-context.outputs.should_continue == 'true'
+    uses: ./.github/workflows/discord-gpt-message.yml
+    with:
+      webhook_username: "Avery - Review"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=AveryReview"
+      prompt: |
+        finished fix iteration ${{ needs.extract-context.outputs.iteration }}/3 for PR #${{ needs.extract-context.outputs.pr_number }}
+
+        issue: #${{ needs.extract-context.outputs.issue_number }}
+        result: ${{ needs.handle-review-result.result == 'success' && 'fixes applied' || 'issues encountered' }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}

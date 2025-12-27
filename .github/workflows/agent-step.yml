@@ -3,102 +3,362 @@ name: Agent Step
 on:
   workflow_call:
     inputs:
+      work_branch:
+        description: "Remote branch created by the orchestrator for the issue"
+        required: true
+        type: string
       agent_name:
-        description: 'Name of the agent to run'
+        description: "Name of the agent to run"
         required: true
         type: string
       phase:
-        description: 'Phase of execution (pre, main, post, review)'
+        description: "Phase of execution (pre, main, post, review, fix)"
         required: true
         type: string
       issue_number:
-        description: 'Issue number being processed'
+        description: "Issue number being processed"
         required: true
         type: string
       issue_context:
-        description: 'Context summary from orchestrator'
+        description: "Context summary from orchestrator"
         required: true
         type: string
       agent_prompts:
-        description: 'JSON object containing prompts for each agent'
+        description: "JSON object containing prompts for each agent"
         required: true
         type: string
       planning_context:
-        description: 'Context from planning agents'
+        description: "Context from planning agents"
         required: false
         type: string
-        default: ''
+        default: ""
       pr_number:
-        description: 'PR number for review phase'
+        description: "PR number for review/fix phase"
         required: false
         type: string
-        default: ''
+        default: ""
+      review_feedback:
+        description: "Review comments to address (for fix phase)"
+        required: false
+        type: string
+        default: ""
+      fix_iteration:
+        description: "Current fix iteration 1-3 (for fix phase)"
+        required: false
+        type: string
+        default: "1"
     outputs:
       result:
-        description: 'Agent output result'
-        value: ${{ jobs.run-agent.outputs.result }}
+        description: "Agent output result"
+        value: ${{ jobs.run_agent.outputs.result }}
       success:
-        description: 'Whether the agent completed successfully'
-        value: ${{ jobs.run-agent.outputs.success }}
+        description: "Whether the agent completed successfully"
+        value: ${{ jobs.run_agent.outputs.success }}
+
+concurrency:
+  group: issue-${{ inputs.issue_number }}-${{ inputs.agent_name }}-${{ inputs.phase }}
+  cancel-in-progress: false
 
 jobs:
-  run-agent:
+  run_agent:
     name: Run ${{ inputs.agent_name }} (${{ inputs.phase }})
     runs-on: ubuntu-latest
     outputs:
-      result: ${{ steps.agent.outputs.result }}
-      success: ${{ steps.agent.outputs.success }}
+      result: ${{ steps.parse.outputs.result }}
+      success: ${{ steps.parse.outputs.success }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 50
+          fetch-depth: 0
           token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
 
-      - name: Configure git
+      - name: Checkout work branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          ref: ${{ inputs.work_branch }}
+
+      - name: Configure git + hard clean
+        shell: bash
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull origin HEAD
+
+          # Ensure we're truly on the branch, synced, and pristine
+          git fetch origin "${{ inputs.work_branch }}"
+          git checkout -B "${{ inputs.work_branch }}" "origin/${{ inputs.work_branch }}"
+          git reset --hard
+          git clean -ffdx
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
-      - name: Build MCP Discord
-        working-directory: tools/mcp-discord
+      - name: Build MCP Discord (outside git worktree)
+        shell: bash
         run: |
+          set -euo pipefail
+          rm -rf /tmp/mcp-discord
+          cp -R tools/mcp-discord /tmp/mcp-discord
+          cd /tmp/mcp-discord
           npm ci
           npm run build
 
       - name: Create MCP config
+        shell: bash
         run: |
+          set -euo pipefail
+
+          # Map agent names to friendly persona names (matches notify job usernames)
+          AGENT="${{ inputs.agent_name }}"
+          case "$AGENT" in
+            documentation-sheriff) PERSONA="Riley - Docs" ;;
+            infrastructure-engineer) PERSONA="Sam - Infra" ;;
+            security-engineer) PERSONA="Casey - Security" ;;
+            product-owner) PERSONA="Morgan - Product" ;;
+            ux-designer) PERSONA="Drew - UX" ;;
+            tech-lead) PERSONA="Taylor - Lead" ;;
+            software-engineer) PERSONA="Alex - Dev" ;;
+            test-engineer) PERSONA="Jamie - QA" ;;
+            project-manager) PERSONA="Jordan - PM" ;;
+            code-reviewer) PERSONA="Avery - Review" ;;
+            *) PERSONA="$AGENT" ;;
+          esac
+
           cat > /tmp/mcp-config.json << EOF
           {
             "mcpServers": {
               "discord": {
                 "command": "node",
-                "args": ["${{ github.workspace }}/tools/mcp-discord/dist/index.js"],
+                "args": ["/tmp/mcp-discord/dist/index.js"],
                 "env": {
                   "DISCORD_WEBHOOK_URL": "${{ secrets.DISCORD_DEV_WEBHOOK_URL }}",
                   "DISCORD_DEFAULT_CHANNEL_ID": "${{ vars.DISCORD_DEV_CHANNEL_ID || '1453129264118370434' }}",
-                  "AGENT_NAME": "${{ inputs.agent_name }}"
+                  "AGENT_NAME": "$PERSONA"
                 }
               }
             }
           }
           EOF
 
+      # ========================================================================
+      # ROLE-BASED PERMISSIONS: Comprehensive tool access per agent role
+      # See: .github/workflows/claude-settings.yml for tool matrix reference
+      # ========================================================================
+      - name: Classify agent role and determine permissions
+        id: exec_policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          AGENT="${{ inputs.agent_name }}"
+          PHASE="${{ inputs.phase }}"
+
+          # Determine granular role class based on agent name
+          case "$AGENT" in
+            product-owner|ux-designer|tech-lead|project-manager)
+              ROLE_CLASS="planning"
+              ;;
+            software-engineer)
+              ROLE_CLASS="implementation"
+              ;;
+            infrastructure-engineer)
+              ROLE_CLASS="infrastructure"
+              ;;
+            test-engineer)
+              ROLE_CLASS="testing"
+              ;;
+            security-engineer)
+              ROLE_CLASS="security"
+              ;;
+            documentation-sheriff)
+              ROLE_CLASS="documentation"
+              ;;
+            code-reviewer)
+              ROLE_CLASS="review"
+              ;;
+            *)
+              ROLE_CLASS="unknown"
+              ;;
+          esac
+
+          # Determine permission mode based on role and phase
+          PERMISSION_MODE="acceptEdits"
+          case "$PHASE" in
+            main|post|fix)
+              case "$ROLE_CLASS" in
+                implementation|infrastructure|testing|security|documentation)
+                  PERMISSION_MODE="bypassPermissions"
+                  ;;
+              esac
+              ;;
+          esac
+
+          # Determine git write access
+          ALLOW_GIT_WRITE="false"
+          case "$ROLE_CLASS" in
+            planning|implementation|infrastructure|testing|security|documentation)
+              ALLOW_GIT_WRITE="true"
+              ;;
+          esac
+
+          echo "permission_mode=$PERMISSION_MODE" >> "$GITHUB_OUTPUT"
+          echo "role_class=$ROLE_CLASS" >> "$GITHUB_OUTPUT"
+          echo "allow_git_write=$ALLOW_GIT_WRITE" >> "$GITHUB_OUTPUT"
+
+          echo "Agent: $AGENT | Phase: $PHASE | Role: $ROLE_CLASS | Mode: $PERMISSION_MODE | Git Write: $ALLOW_GIT_WRITE"
+
+      - name: Generate role-specific Claude settings
+        id: settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .claude
+
+          ROLE_CLASS="${{ steps.exec_policy.outputs.role_class }}"
+          PERMISSION_MODE="${{ steps.exec_policy.outputs.permission_mode }}"
+
+          # ================================================================
+          # TOOL DEFINITIONS - Comprehensive access per role
+          # ================================================================
+
+          # Base tools for ALL agents
+          BASE_TOOLS='"Read","Grep","Glob","Edit","Write"'
+
+          # Git read tools (all agents can read)
+          GIT_READ='"Bash(git status)","Bash(git log:*)","Bash(git diff:*)","Bash(git show:*)","Bash(git branch:*)"'
+
+          # Git write tools (implementation/validation agents)
+          GIT_WRITE='"Bash(git fetch:*)","Bash(git checkout:*)","Bash(git pull:*)","Bash(git rebase:*)","Bash(git add:*)","Bash(git commit:*)","Bash(git push:*)","Bash(git merge:*)","Bash(git stash:*)","Bash(git reset:*)","Bash(git clean:*)"'
+
+          # File exploration tools
+          FILE_TOOLS='"Bash(cat:*)","Bash(find:*)","Bash(ls:*)","Bash(head:*)","Bash(tail:*)","Bash(wc:*)","Bash(tree:*)","Bash(file:*)"'
+
+          # Utility tools
+          UTIL_TOOLS='"Bash(jq:*)","Bash(sed:*)","Bash(awk:*)","Bash(grep:*)","Bash(mkdir:*)","Bash(echo:*)","Bash(cp:*)","Bash(mv:*)","Bash(rm:*)","Bash(touch:*)","Bash(dirname:*)","Bash(basename:*)","Bash(realpath:*)","Bash(pwd)"'
+
+          # Dotnet build/test tools
+          DOTNET_BUILD='"Bash(dotnet build:*)","Bash(dotnet restore:*)","Bash(dotnet clean:*)","Bash(dotnet publish:*)"'
+          DOTNET_TEST='"Bash(dotnet test:*)","Bash(dotnet run:*)"'
+
+          # NPM build tools
+          NPM_BUILD='"Bash(npm ci)","Bash(npm ci:*)","Bash(npm install)","Bash(npm install:*)","Bash(npm run build)","Bash(npm run build:*)","Bash(npx:*)"'
+
+          # NPM test tools
+          NPM_TEST='"Bash(npm test)","Bash(npm test:*)","Bash(npm run test)","Bash(npm run test:*)","Bash(npm run type-check)","Bash(npm run type-check:*)","Bash(npm run lint)","Bash(npm run lint:*)","Bash(npm run format:*)"'
+
+          # Infrastructure-specific tools (CDK, AWS, Docker)
+          CDK_TOOLS='"Bash(npx cdk:*)","Bash(cdk:*)","Bash(npx aws-cdk:*)"'
+          AWS_TOOLS='"Bash(aws s3:*)","Bash(aws sts:*)","Bash(aws cloudformation:*)","Bash(aws ecs:*)","Bash(aws ecr:*)","Bash(aws logs:*)","Bash(aws lambda:*)","Bash(aws rds:*)"'
+          DOCKER_TOOLS='"Bash(docker build:*)","Bash(docker compose:*)","Bash(docker ps:*)","Bash(docker images:*)","Bash(docker logs:*)","Bash(docker exec:*)","Bash(docker run:*)"'
+
+          # Testing-specific tools (Jest, Playwright, Coverage)
+          JEST_TOOLS='"Bash(npx jest:*)","Bash(jest:*)"'
+          PLAYWRIGHT_TOOLS='"Bash(npx playwright:*)","Bash(playwright:*)"'
+          COVERAGE_TOOLS='"Bash(npm run coverage)","Bash(npm run coverage:*)"'
+
+          # Security-specific tools (Audit, Scanning)
+          AUDIT_TOOLS='"Bash(npm audit)","Bash(npm audit:*)","Bash(dotnet list:*)","Bash(npx audit-ci:*)","Bash(npx snyk:*)"'
+          SECURITY_AWS='"Bash(aws iam:*)","Bash(aws kms:*)","Bash(aws secretsmanager:*)"'
+
+          # GitHub CLI tools (for code reviewer)
+          GH_TOOLS='"Bash(gh pr:*)","Bash(gh issue:*)","Bash(gh api:*)","Bash(gh repo:*)","Bash(gh run:*)","Bash(gh workflow:*)"'
+
+          # Denied tools (security - applies to all)
+          DENY_TOOLS='"Bash(curl:*)","Bash(wget:*)","Bash(sudo:*)","Bash(chmod 777:*)","Bash(chown:*)","Bash(apt:*)","Bash(yum:*)","Bash(brew:*)"'
+
+          # ================================================================
+          # BUILD ALLOW LIST BASED ON ROLE CLASS
+          # ================================================================
+          case "$ROLE_CLASS" in
+            planning)
+              # Planning agents: read-only, file exploration, limited git
+              ALLOW_LIST="$BASE_TOOLS,$GIT_READ,$FILE_TOOLS"
+              ;;
+
+            implementation)
+              # Software engineer: full development toolset
+              ALLOW_LIST="$BASE_TOOLS,$GIT_READ,$GIT_WRITE,$FILE_TOOLS,$UTIL_TOOLS,$DOTNET_BUILD,$DOTNET_TEST,$NPM_BUILD,$NPM_TEST"
+              ;;
+
+            infrastructure)
+              # Infrastructure engineer: software engineer + CDK/AWS/Docker
+              ALLOW_LIST="$BASE_TOOLS,$GIT_READ,$GIT_WRITE,$FILE_TOOLS,$UTIL_TOOLS,$DOTNET_BUILD,$DOTNET_TEST,$NPM_BUILD,$NPM_TEST,$CDK_TOOLS,$AWS_TOOLS,$DOCKER_TOOLS"
+              ;;
+
+            testing)
+              # Test engineer: validation + testing frameworks + coverage
+              ALLOW_LIST="$BASE_TOOLS,$GIT_READ,$GIT_WRITE,$FILE_TOOLS,$UTIL_TOOLS,$DOTNET_BUILD,$DOTNET_TEST,$NPM_BUILD,$NPM_TEST,$JEST_TOOLS,$PLAYWRIGHT_TOOLS,$COVERAGE_TOOLS"
+              ;;
+
+            security)
+              # Security engineer: validation + audit tools + limited AWS
+              ALLOW_LIST="$BASE_TOOLS,$GIT_READ,$GIT_WRITE,$FILE_TOOLS,$UTIL_TOOLS,$DOTNET_BUILD,$DOTNET_TEST,$NPM_BUILD,$NPM_TEST,$AUDIT_TOOLS,$SECURITY_AWS"
+              ;;
+
+            documentation)
+              # Documentation sheriff: minimal bash, git for doc commits, file exploration
+              ALLOW_LIST="$BASE_TOOLS,$GIT_READ,$GIT_WRITE,$FILE_TOOLS,$UTIL_TOOLS"
+              ;;
+
+            review)
+              # Code reviewer: GitHub CLI + git write for issue context updates
+              ALLOW_LIST="$BASE_TOOLS,$GIT_READ,$GIT_WRITE,$FILE_TOOLS,$UTIL_TOOLS,$GH_TOOLS"
+              ;;
+
+            *)
+              # Unknown role: base tools only for safety
+              ALLOW_LIST="$BASE_TOOLS,$GIT_READ,$FILE_TOOLS"
+              ;;
+          esac
+
+          # MCP Discord tool - all agents get this
+          MCP_ALLOWED="mcp__discord__discord_post_dev_update"
+
+          # ================================================================
+          # WRITE SETTINGS FILE
+          # ================================================================
+          cat > .claude/settings.local.json << EOF
+          {
+            "permissions": {
+              "defaultMode": "$PERMISSION_MODE",
+              "allow": [
+                $ALLOW_LIST
+              ],
+              "deny": [
+                $DENY_TOOLS
+              ]
+            }
+          }
+          EOF
+
+          # Validate JSON
+          if ! jq empty .claude/settings.local.json 2>/dev/null; then
+            echo "ERROR: Generated invalid JSON"
+            cat .claude/settings.local.json
+            exit 1
+          fi
+
+          # Output the MCP allowed tools for claude_args
+          echo "mcp_allowed=$MCP_ALLOWED" >> "$GITHUB_OUTPUT"
+
+          echo "Generated settings for $ROLE_CLASS:"
+          cat .claude/settings.local.json | jq .
+
       - name: Load agent definition
         id: definition
         run: |
           DEFINITION_PATH="working/agents/definitions/${{ inputs.agent_name }}.md"
           if [ -f "$DEFINITION_PATH" ]; then
-            DEFINITION=$(cat "$DEFINITION_PATH")
-            echo "definition<<EOF" >> $GITHUB_OUTPUT
-            echo "$DEFINITION" >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
+            DELIM="EOF_$(openssl rand -hex 8)"
+            echo "definition<<$DELIM" >> $GITHUB_OUTPUT
+            cat "$DEFINITION_PATH" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            echo "$DELIM" >> $GITHUB_OUTPUT
           else
             echo "definition=No definition file found" >> $GITHUB_OUTPUT
           fi
@@ -108,10 +368,11 @@ jobs:
         run: |
           MEMORY_PATH="working/agents/memory/${{ inputs.agent_name }}/MEMORY.md"
           if [ -f "$MEMORY_PATH" ]; then
-            MEMORY=$(cat "$MEMORY_PATH")
-            echo "memory<<EOF" >> $GITHUB_OUTPUT
-            echo "$MEMORY" >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
+            DELIM="EOF_$(openssl rand -hex 8)"
+            echo "memory<<$DELIM" >> $GITHUB_OUTPUT
+            cat "$MEMORY_PATH" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            echo "$DELIM" >> $GITHUB_OUTPUT
           else
             echo "memory=No memory file found" >> $GITHUB_OUTPUT
           fi
@@ -128,9 +389,11 @@ jobs:
               fi
             done
           fi
-          echo "files<<EOF" >> $GITHUB_OUTPUT
+          DELIM="EOF_$(openssl rand -hex 8)"
+          echo "files<<$DELIM" >> $GITHUB_OUTPUT
           echo -e "$SUPPLEMENTARY" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo "$DELIM" >> $GITHUB_OUTPUT
 
       - name: Find issue context file
         id: issue_file
@@ -143,19 +406,30 @@ jobs:
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Extract agent prompt
+      - name: Extract agent prompt (non-fatal)
         id: prompt
         uses: actions/github-script@v7
+        env:
+          AGENT_PROMPTS_JSON: ${{ inputs.agent_prompts }}
         with:
           script: |
             const agentName = '${{ inputs.agent_name }}'.replace(/-/g, '_');
-            const prompts = JSON.parse('${{ inputs.agent_prompts }}');
-            const agentConfig = prompts[agentName] || {};
-            core.setOutput('task', agentConfig.prompt || 'No specific task assigned');
-            core.setOutput('phase_config', agentConfig.phase || 'main');
 
-      - name: Build system prompt
-        id: system
+            const raw = (process.env.AGENT_PROMPTS_JSON || '').trim();
+            if (!raw) {
+              core.setOutput('task', 'No agent_prompts were provided. Read the issue context file and proceed according to your role + phase instructions.');
+              core.setOutput('phase_config', '${{ inputs.phase }}');
+              return;
+            }
+
+            let prompts = JSON.parse(raw);
+            if (typeof prompts === 'string') prompts = JSON.parse(prompts);
+
+            const agentConfig = prompts[agentName] || {};
+            core.setOutput('task', agentConfig.prompt || 'No specific task assigned. Use your role + phase instructions to proceed.');
+            core.setOutput('phase_config', agentConfig.phase || '${{ inputs.phase }}');
+
+      - name: Build system prompt file
         run: |
           cat << 'EOF' > /tmp/system_prompt.txt
           # Agent: ${{ inputs.agent_name }}
@@ -180,22 +454,18 @@ jobs:
           ## Issue Context File
           The issue context file is at: ${{ steps.issue_file.outputs.path }}
           This file contains pre-planning information and should be updated with your findings.
-          Post agents: Pay close attention to this file for context on what was planned.
 
           ## Planning Context
           ${{ inputs.planning_context }}
 
           ## Key Repository Files
-
           ### DEVLOG.md
-          This is a LARGE development log file at the repository root. It contains session summaries of all prior work.
+          This is a LARGE development log file at the repository root.
           - DO NOT read the entire file
           - To get recent context: grep for "## Session" and read the latest entry
-          - You can refer to DEVLOG.md to understand what happened in previous sessions
 
           ### ABOUT.md
           Contains product information, business requirements, and milestones.
-          Planning agents should reference this for alignment with business goals.
 
           ### working/issues/
           Contains context files for each issue being processed.
@@ -204,137 +474,357 @@ jobs:
           ## Phase-Specific Instructions
           EOF
 
+          case "${{ inputs.agent_name }}" in
+            "product-owner"|"ux-designer"|"tech-lead"|"project-manager")
+              cat << 'PLAN_ONLY_EOF' >> /tmp/system_prompt.txt
+
+          # ROLE BOUNDARY (PLANNING-ONLY)
+          You are a PLANNING-ONLY agent.
+          - You MUST NOT implement changes in application code, infrastructure, or tests.
+          - You MUST NOT create commits, push branches, or open PRs.
+          - You MAY edit ONLY:
+            - the issue context file (working/issues/...)
+            - your memory files (working/agents/memory/...)
+          PLAN_ONLY_EOF
+              ;;
+          esac
+
           case "${{ inputs.phase }}" in
             "pre")
               cat << 'PHASE_EOF' >> /tmp/system_prompt.txt
-          You are running in the PRE phase. Your responsibilities:
-          1. Gather context needed for downstream agents
-          2. Document current state before changes
-          3. Identify risks or blockers early
-          4. Update your memory files with relevant findings
-          5. Update the issue context file with your pre-planning findings
-          6. Output a summary for use by other agents
+          You are running in the PRE phase.
+          - Gather context
+          - Update issue context file with findings
+          - Update memory as needed
           PHASE_EOF
               ;;
             "main")
               cat << 'PHASE_EOF' >> /tmp/system_prompt.txt
-          You are running in the MAIN phase. Your responsibilities:
-          1. Read the issue context file for pre-planning information
-          2. Execute your primary task as assigned
-          3. Make necessary changes to the codebase
-          4. Commit changes with clear messages referencing the issue
-          5. Update your memory files with decisions made
-          6. Update the issue context file with implementation notes
-          7. Output a summary of work completed
+          You are running in the MAIN phase.
+          - Execute your assigned task
+          - Update issue context + memory
+          - Implementation agents: commit only if you made changes
           PHASE_EOF
               ;;
             "post")
               cat << 'PHASE_EOF' >> /tmp/system_prompt.txt
-          You are running in the POST phase. Your responsibilities:
-          1. Read the issue context file carefully - it contains all pre-planning and implementation context
-          2. Review and validate work done in earlier phases
-          3. Make any necessary follow-up changes
-          4. Update documentation and memory files
-          5. Update the issue context file with validation results
-          6. Ensure all artifacts are properly committed
-          7. Output a summary of validation results
+          You are running in the POST phase.
+          - Validate earlier work
+          - Make necessary follow-ups
+          - Update issue context + memory
           PHASE_EOF
               ;;
             "review")
               cat << 'PHASE_EOF' >> /tmp/system_prompt.txt
-          You are running in the REVIEW phase. Your responsibilities:
-          1. Read the issue context file for full context on what was planned and implemented
-          2. Review the pull request #${{ inputs.pr_number }}
-          3. Check code quality and adherence to standards
-          4. Verify tests pass and coverage is adequate
-          5. Leave review comments as appropriate
-          6. Approve or request changes
+          You are running in the REVIEW phase.
+          - Review PR #${{ inputs.pr_number }}
+          - Leave review feedback
+          PHASE_EOF
+              ;;
+            "fix")
+              cat << PHASE_EOF >> /tmp/system_prompt.txt
+          You are running in the FIX phase (iteration ${{ inputs.fix_iteration }}/3).
+          - You are addressing code review feedback on PR #${{ inputs.pr_number }}
+          - Focus ONLY on the specific issues raised in the review
+          - Do NOT add new features or refactor unrelated code
+          - Update the issue context file with what you fixed
+          - The review feedback is below
+
+          ## Review Feedback to Address
+          ${{ inputs.review_feedback }}
           PHASE_EOF
               ;;
           esac
 
-          SYSTEM_PROMPT=$(cat /tmp/system_prompt.txt)
-          echo "prompt<<EOF" >> $GITHUB_OUTPUT
-          echo "$SYSTEM_PROMPT" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          # Add Discord MCP tool instructions for all agents
+          cat << 'DISCORD_EOF' >> /tmp/system_prompt.txt
+
+          ## Discord Updates (MCP Tool)
+          You have access to the `discord_post_dev_update` MCP tool to post updates to the #dev Discord channel.
+          Do this as you switch contexts or make significant progress in order to keep your team tightly informed.
+
+          **Use for**:
+          - **progress**: Milestone completions, significant task progress
+          - **delay**: Blockers encountered, unexpected issues
+          - **tech_debt**: Technical debt discoveries worth noting
+          - **thinking**: Significant decisions or reasoning worth sharing
+
+          **How to write messages:**
+          - write like a dev in slack. lowercase, brief, no fluff.
+          - no @everyone or @here. under 280 chars ideally, 500 max.
+          - sound like a real person updating the team on what YOU are doing right now.
+          - don't summarize the whole issue - just your current step.
+          - no bullet points, no headers, just plain text.
+          - one or two sentences max. conversational.
+          - do NOT mention any contextual documents with "n/a"
+          - post when you have something meaningful to share, not just to fill silence
+          DISCORD_EOF
+
+      - name: Write agent output schema (file)
+        id: schema # <--- Add ID
+        run: |
+          cat > /tmp/agent_output_schema.json <<'JSON'
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "success",
+              "summary",
+              "files_changed",
+              "commits_made",
+              "memory_updated",
+              "issue_context_updated",
+              "blockers",
+              "notes_for_next_agent"
+            ],
+            "properties": {
+              "success": { "type": "boolean" },
+              "summary": { "type": "string" },
+              "files_changed": { "type": "array", "items": { "type": "string" } },
+              "commits_made": { "type": "array", "items": { "type": "string" } },
+              "memory_updated": { "type": "boolean" },
+              "issue_context_updated": { "type": "boolean" },
+              "blockers": { "type": "array", "items": { "type": "string" } },
+              "notes_for_next_agent": { "type": "string" }
+            }
+          }
+          JSON
+
+          # Output the compact JSON string for the CLI arg
+          echo "content=$(jq -c . /tmp/agent_output_schema.json)" >> "$GITHUB_OUTPUT"
 
       - name: Run agent
         id: agent
-        uses: anthropics/claude-code-action@beta
+        uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
-          claude_args: --mcp-config /tmp/mcp-config.json
-          system_prompt: ${{ steps.system.outputs.prompt }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --mcp-config /tmp/mcp-config.json
+            --model claude-opus-4-5-20251101
+            --json-schema '${{ steps.schema.outputs.content }}'
+            --max-turns 6000
+            --system-prompt-file /tmp/system_prompt.txt
+            --permission-mode ${{ steps.exec_policy.outputs.permission_mode }}
+            --allowedTools ${{ steps.settings.outputs.mcp_allowed }}
           prompt: |
             ## Your Task
             ${{ steps.prompt.outputs.task }}
 
-            ## Requirements
-            1. Complete your assigned task thoroughly
-            2. Read the issue context file at: ${{ steps.issue_file.outputs.path }}
-            3. Update your memory files as appropriate
-            4. Update the issue context file with your work/findings
-            5. Commit any code changes with proper messages
-            6. Output a JSON summary of your work
+            Return ONLY the final JSON.
 
-            ## Discord Updates (via MCP)
-            You have access to the `discord_post_dev_update` MCP tool to post updates to the #dev Discord channel.
-            Post 1-3 updates during your session for any of the following:
-            - **tech_debt**: Observations about technical debt you encounter
-            - **progress**: Significant milestones or task completions
-            - **delay**: Blockers or reasons for delays
-            - **thinking**: Significant decisions or reasoning steps
+      - name: Auto-commit planning artifacts (issue context + memory)
+        if: always() && steps.exec_policy.outputs.role_class == 'planning'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add working/issues working/agents/memory || true
+          if git diff --cached --quiet; then
+            echo "No planning artifacts changed; nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore: planning update for #${{ inputs.issue_number }} (${{ inputs.agent_name }})"
 
-            Keep messages concise (1-2 sentences). Example:
-            - tech_debt: "Found duplicated validation logic across 3 controllers - would benefit from extraction to shared utility"
-            - progress: "Completed user authentication module with JWT token refresh"
-            - delay: "Blocked on missing API documentation for external payment service"
-            - thinking: "Choosing repository pattern over direct DB access for better testability"
+      - name: Auto-commit implementation/validation changes
+        if: |
+          always() && (
+            steps.exec_policy.outputs.role_class == 'implementation' ||
+            steps.exec_policy.outputs.role_class == 'infrastructure' ||
+            steps.exec_policy.outputs.role_class == 'testing' ||
+            steps.exec_policy.outputs.role_class == 'security' ||
+            steps.exec_policy.outputs.role_class == 'documentation'
+          )
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            if git diff --cached --quiet; then
+              echo "Dirty tree, but nothing staged; skipping commit."
+              exit 0
+            fi
+            git commit -m "chore: agent changes for #${{ inputs.issue_number }} (${{ inputs.agent_name }}:${{ inputs.phase }})"
+          else
+            echo "Working tree clean; nothing to commit."
+          fi
 
-            ## Expected Output Format
-            After completing your work, output a JSON summary:
-            ```json
-            {
-              "success": boolean,
-              "summary": "Brief description of what was done",
-              "files_changed": [],
-              "commits_made": [],
-              "memory_updated": boolean,
-              "issue_context_updated": boolean,
-              "blockers": [],
-              "notes_for_next_agent": ""
-            }
-            ```
+      - name: Push work branch (with retry for concurrent agents)
+        if: always() && steps.exec_policy.outputs.allow_git_write == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="${{ inputs.work_branch }}"
+          MAX_RETRIES=5
+          RETRY_DELAY=2
 
-      - name: Parse agent output
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            echo "Push attempt $attempt of $MAX_RETRIES..."
+            
+            # Try to push
+            if git push -u origin "$BRANCH" 2>&1; then
+              echo "Push succeeded on attempt $attempt"
+              exit 0
+            fi
+            
+            # If we're on the last attempt, fail
+            if [ "$attempt" -eq "$MAX_RETRIES" ]; then
+              echo "ERROR: Push failed after $MAX_RETRIES attempts"
+              exit 1
+            fi
+            
+            echo "Push failed (likely concurrent update), rebasing and retrying..."
+            
+            # Before rebase, stash any uncommitted changes (rebase requires clean tree)
+            STASHED=false
+            if [ -n "$(git status --porcelain)" ]; then
+              echo "Stashing uncommitted changes before rebase..."
+              git stash push -u -m "auto-stash before rebase"
+              STASHED=true
+            fi
+            
+            # Fetch latest and rebase
+            git fetch origin "$BRANCH"
+            
+            # Rebase our commits on top of remote
+            if ! git rebase "origin/$BRANCH"; then
+              echo "Rebase conflict detected, attempting auto-resolution..."
+              # For agent-generated changes, prefer our changes on conflict
+              git rebase --abort 2>/dev/null || true
+              git pull --rebase -X theirs origin "$BRANCH" || {
+                echo "ERROR: Could not resolve rebase conflicts automatically"
+                git rebase --abort 2>/dev/null || true
+                # Restore stashed changes before exiting
+                if [ "$STASHED" = true ]; then
+                  git stash pop || echo "Warning: stash pop failed after rebase error"
+                fi
+                exit 1
+              }
+            fi
+            
+            # Restore stashed changes after successful rebase
+            if [ "$STASHED" = true ]; then
+              echo "Restoring stashed changes..."
+              git stash pop || {
+                echo "Warning: stash pop failed, changes may be in stash list"
+              }
+            fi
+            
+            # Exponential backoff with jitter
+            SLEEP_TIME=$((RETRY_DELAY * attempt + RANDOM % 3))
+            echo "Waiting ${SLEEP_TIME}s before retry..."
+            sleep "$SLEEP_TIME"
+          done
+
+      - name: Parse agent output (defensive)
         id: parse
+        if: always()
         uses: actions/github-script@v7
+        env:
+          RAW_STRUCTURED: ${{ steps.agent.outputs.structured_output }}
+          RAW_RESULT: ${{ steps.agent.outputs.result }}
         with:
           script: |
-            const output = `${{ steps.agent.outputs.result }}`;
-            try {
-              const jsonMatch = output.match(/```json\s*([\s\S]*?)\s*```/);
-              if (jsonMatch) {
-                const result = JSON.parse(jsonMatch[1]);
-                core.setOutput('success', result.success);
-                core.setOutput('result', JSON.stringify(result));
-              } else {
-                core.setOutput('success', true);
-                core.setOutput('result', JSON.stringify({ summary: output }));
+            const rawStructured = (process.env.RAW_STRUCTURED || '').trim();
+            const rawResult = (process.env.RAW_RESULT || '').trim();
+            const raw = rawStructured || rawResult;
+
+            const tryParse = (s) => { try { return JSON.parse(s); } catch { return null; } };
+
+            let parsed = tryParse(raw);
+
+            if (!parsed && raw) {
+              const cleaned = raw
+                .replace(/<thinking[\s\S]*?<\/thinking>/gi, "")
+                .replace(/<analysis[\s\S]*?<\/analysis>/gi, "")
+                .replace(/```(?:json)?/gi, "")
+                .replace(/```/g, "")
+                .trim();
+
+              const start = cleaned.indexOf("{");
+              const end = cleaned.lastIndexOf("}");
+              if (start !== -1 && end !== -1 && end > start) {
+                parsed = tryParse(cleaned.slice(start, end + 1));
               }
-            } catch (e) {
-              core.setOutput('success', true);
-              core.setOutput('result', JSON.stringify({ summary: output }));
             }
 
-      - name: Commit updates
-        run: |
-          git add working/agents/memory/${{ inputs.agent_name }}/ || true
-          git add working/issues/ || true
-          if ! git diff --staged --quiet; then
-            git commit -m "chore(${{ inputs.agent_name }}): update agent memory and issue context [${{ inputs.phase }}]
+            if (!parsed) {
+              throw new Error("Agent output was not valid JSON.");
+            }
 
-            Issue: #${{ inputs.issue_number }}"
-            git push
-          fi
+            core.setOutput('success', String(!!parsed.success));
+            core.setOutput('result', JSON.stringify(parsed));
+            core.setOutput('has_result', 'true');
+
+      # Submit PR review to GitHub (code-reviewer only)
+      # This converts the agent's JSON output into an actual GitHub PR review
+      - name: Submit PR review (code-reviewer only)
+        if: |
+          always() &&
+          inputs.agent_name == 'code-reviewer' &&
+          (inputs.phase == 'review' || inputs.phase == 'fix') &&
+          steps.parse.outputs.has_result == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            // Defensive parsing pattern - matches orchestrator and parse step
+            const resultJson = (process.env.AGENT_RESULT || '').trim();
+
+            if (!resultJson) {
+              console.log('No agent result available, skipping review submission');
+              return;
+            }
+
+            let result;
+            try {
+              result = JSON.parse(resultJson);
+            } catch (e) {
+              console.log('Failed to parse agent result:', e.message);
+              console.log('Raw value:', resultJson.slice(0, 500));
+              return;
+            }
+
+            const prNumber = parseInt('${{ inputs.pr_number }}');
+
+            if (!prNumber) {
+              console.log('No PR number provided, skipping review submission');
+              return;
+            }
+
+            // Determine review event type from agent output
+            const isApproved = result.approved === true || result.review_status === 'APPROVED';
+            const event = isApproved ? 'APPROVE' : 'REQUEST_CHANGES';
+
+            // Build review body from agent output
+            let body = result.summary || '';
+
+            if (!isApproved && result.blocking_issues?.length > 0) {
+              body += '\n\n## Blocking Issues\n';
+              for (const issue of result.blocking_issues) {
+                body += `\n- **${issue.file}${issue.line ? `:${issue.line}` : ''}**: ${issue.issue}`;
+                if (issue.suggestion) {
+                  body += `\n  - Suggestion: ${issue.suggestion}`;
+                }
+              }
+            }
+
+            if (result.suggestions?.length > 0) {
+              body += '\n\n## Suggestions\n';
+              for (const s of result.suggestions) {
+                body += `\n- **${s.file}${s.line ? `:${s.line}` : ''}**: ${s.suggestion}`;
+              }
+            }
+
+            console.log(`Submitting ${event} review for PR #${prNumber}`);
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              event: event,
+              body: body || (isApproved ? 'LGTM! All requirements met.' : 'Changes requested - see blocking issues above.')
+            });
+
+            console.log(`Review submitted: ${event}`)
+        env:
+          AGENT_RESULT: ${{ steps.parse.outputs.result }}

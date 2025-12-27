@@ -1,0 +1,87 @@
+name: Deploy Business Bot
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'tools/business-bot/**'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ECR_REPOSITORY: ${{ vars.BUSINESS_BOT_ECR_REPO || 'soyl-business-bot' }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER || 'soyl-cluster' }}
+  ECS_SERVICE: ${{ vars.BUSINESS_BOT_ECS_SERVICE || 'soyl-business-bot' }}
+  ECS_TASK_DEFINITION: ${{ vars.BUSINESS_BOT_ECS_TASK || 'soyl-business-bot' }}
+  CONTAINER_NAME: business-bot
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Business Bot
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        working-directory: tools/business-bot
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition --task-definition ${{ env.ECS_TASK_DEFINITION }} \
+            --query taskDefinition > task-definition.json
+
+      - name: Update environment variables in task definition
+        run: |
+          jq '.containerDefinitions[0].environment = [
+            {"name": "NODE_ENV", "value": "production"},
+            {"name": "BOT_SQLITE_PATH", "value": "/data/business-bot.sqlite"},
+            {"name": "DISCORD_ADMIN_USER_IDS", "value": "${{ vars.BUSINESS_BOT_ADMIN_USER_IDS }}"},
+            {"name": "DISCORD_TEAM_USER_IDS", "value": "${{ vars.BUSINESS_BOT_TEAM_USER_IDS }}"},
+            {"name": "GITHUB_ORG", "value": "${{ vars.BUSINESS_BOT_GITHUB_ORG }}"},
+            {"name": "NAMECHEAP_CLIENT_IP", "value": "${{ vars.BUSINESS_BOT_NAMECHEAP_CLIENT_IP }}"},
+            {"name": "NAMECHEAP_SANDBOX", "value": "${{ vars.BUSINESS_BOT_NAMECHEAP_SANDBOX || 'false' }}"},
+            {"name": "PRODUCT_BOT_CLIENT_ID", "value": "${{ vars.PRODUCT_BOT_CLIENT_ID }}"}
+          ]' task-definition.json > updated-task-definition.json
+          mv updated-task-definition.json task-definition.json
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true

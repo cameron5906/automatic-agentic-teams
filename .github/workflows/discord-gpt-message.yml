@@ -1,0 +1,221 @@
+name: Discord Message (OpenAI GPT-4o)
+
+on:
+  workflow_call:
+    inputs:
+      prompt:
+        description: "What you want the model to communicate (plain English)."
+        required: true
+        type: string
+
+      instructions:
+        description: "High-level style/tone rules for the model (system guidance)."
+        required: false
+        type: string
+        default: |
+          you write like a dev in slack. lowercase, brief, no fluff.
+          no @everyone or @here. under 280 chars ideally, 500 max.
+          sound like a real person updating the team on what YOU are doing right now.
+          don't summarize the whole issue - just your current step.
+          no bullet points, no headers, just plain text.
+          one or two sentences max. conversational.
+          do NOT mention any contextual documents with "n/a"
+
+      model:
+        description: "OpenAI model id (e.g. gpt-4o or a pinned version)."
+        required: false
+        type: string
+        default: "gpt-4o"
+
+      temperature:
+        description: "Sampling temperature (0..2)."
+        required: false
+        type: number
+        default: 0.2
+
+      max_output_tokens:
+        description: "Max tokens for the message."
+        required: false
+        type: number
+        default: 500
+
+      webhook_username:
+        description: "Optional: override Discord webhook username."
+        required: false
+        type: string
+        default: ""
+
+      webhook_avatar_url:
+        description: "Optional: override Discord webhook avatar URL."
+        required: false
+        type: string
+        default: ""
+
+      dry_run:
+        description: "If true, do not POST to Discord; just emit output."
+        required: false
+        type: boolean
+        default: false
+
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+      DISCORD_WEBHOOK_URL:
+        required: true
+
+    outputs:
+      message:
+        description: "The final message text that was (or would be) sent to Discord."
+        value: ${{ jobs.send.outputs.message }}
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    outputs:
+      message: ${{ steps.out.outputs.message }}
+
+    steps:
+      - name: Ensure jq is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+
+      - name: Compose context + call OpenAI (Responses API)
+        id: gen
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MODEL: ${{ inputs.model }}
+          INSTRUCTIONS: ${{ inputs.instructions }}
+          PROMPT: ${{ inputs.prompt }}
+          TEMP: ${{ inputs.temperature }}
+          MAXTOK: ${{ inputs.max_output_tokens }}
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_WORKFLOW: ${{ github.workflow }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPO}/actions/runs/${GITHUB_RUN_ID}"
+
+          # Give the model a little structured context, without forcing JSON output.
+          FULL_PROMPT="$(cat <<EOF
+          Repo: ${GITHUB_REPO}
+          Workflow: ${GITHUB_WORKFLOW}
+          Actor: ${GITHUB_ACTOR}
+          Ref: ${GITHUB_REF}
+          SHA: ${GITHUB_SHA}
+          Run: ${RUN_URL}
+
+          Task:
+          ${PROMPT}
+          EOF
+          )"
+
+          REQ_JSON="$(jq -n \
+            --arg model "${MODEL}" \
+            --arg instructions "${INSTRUCTIONS}" \
+            --arg input "${FULL_PROMPT}" \
+            --argjson temperature "${TEMP}" \
+            --argjson max_output_tokens "${MAXTOK}" \
+            '{
+              model: $model,
+              instructions: $instructions,
+              input: $input,
+              temperature: $temperature,
+              max_output_tokens: $max_output_tokens,
+              store: false
+            }'
+          )"
+
+          # Call OpenAI Responses API
+          curl -sS https://api.openai.com/v1/responses \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -d "${REQ_JSON}" \
+            > /tmp/openai_response.json
+
+          # Surface API errors
+          if jq -e '.error' /tmp/openai_response.json >/dev/null; then
+            echo "OpenAI API error:"
+            jq -r '.error' /tmp/openai_response.json
+            exit 1
+          fi
+
+          # Prefer output_text when present; fall back to extracting output_text content items.
+          MSG="$(
+            jq -r '
+              if .output_text? and (.output_text|type=="string") then
+                .output_text
+              else
+                ([.output[]?
+                  | select(.type=="message")
+                  | .content[]?
+                  | select(.type=="output_text")
+                  | .text] | join("\n"))
+              end
+            ' /tmp/openai_response.json
+          )"
+
+          # Defensive cleanup: trim and hard cap for Discord (classic limit ~2000; stay under).
+          MSG="$(printf "%s" "$MSG" | sed -e 's/[[:space:]]*$//' )"
+          if [ "${#MSG}" -gt 1800 ]; then
+            MSG="$(printf "%s" "$MSG" | head -c 1797)…"
+          fi
+
+          # Expose as step output (multiline-safe)
+          {
+            echo "message<<EOF"
+            echo "$MSG"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post to Discord webhook
+        if: ${{ inputs.dry_run == false }}
+        shell: bash
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          WEBHOOK_USERNAME: ${{ inputs.webhook_username }}
+          WEBHOOK_AVATAR_URL: ${{ inputs.webhook_avatar_url }}
+          MESSAGE: ${{ steps.gen.outputs.message }}
+        run: |
+          set -euo pipefail
+
+          # Build payload
+          PAYLOAD="$(jq -n \
+            --arg content "$MESSAGE" \
+            --arg username "$WEBHOOK_USERNAME" \
+            --arg avatar_url "$WEBHOOK_AVATAR_URL" \
+            '{
+              content: $content
+            }
+            + (if ($username|length)>0 then {username:$username} else {} end)
+            + (if ($avatar_url|length)>0 then {avatar_url:$avatar_url} else {} end)
+            ')"
+
+          curl -sS -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK_URL" >/dev/null
+
+      - name: Expose message output
+        id: out
+        shell: bash
+        env:
+          MESSAGE: ${{ steps.gen.outputs.message }}
+        run: |
+          set -euo pipefail
+          {
+            echo "message<<EOF"
+            echo "$MESSAGE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"

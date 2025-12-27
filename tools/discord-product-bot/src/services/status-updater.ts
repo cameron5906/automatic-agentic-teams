@@ -1,6 +1,5 @@
-import { Client, ActivityType } from 'discord.js';
-import { team_get_status } from '../tools/agent-tools.js';
-import { generateStatusBlurb } from './blurb-generator.js';
+import { Client, ActivityType, PresenceStatusData } from 'discord.js';
+import { generateStatus, formatElapsedTime } from './blurb-generator.js';
 
 const UPDATE_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -9,7 +8,32 @@ let isUpdating = false;
 let intervalId: ReturnType<typeof setInterval> | null = null;
 
 /**
- * Updates the Discord bot's activity status with a generated blurb from team status.
+ * Maps ActivityType enum to a human-readable string for logging.
+ */
+function activityTypeToString(type: ActivityType): string {
+  switch (type) {
+    case ActivityType.Playing:
+      return 'Playing';
+    case ActivityType.Watching:
+      return 'Watching';
+    case ActivityType.Competing:
+      return 'Competing';
+    case ActivityType.Listening:
+      return 'Listening';
+    case ActivityType.Custom:
+      return 'Custom';
+    default:
+      return 'Unknown';
+  }
+}
+
+/**
+ * Updates the Discord bot's activity status with dynamic activity type.
+ * - Playing: Active coding/building work
+ * - Watching: Review/planning activities
+ * - Competing: Testing/QA activities
+ * - Custom: Idle/ready state
+ * Includes elapsed time tracking for active workflows.
  */
 async function updateStatus(client: Client): Promise<void> {
   if (isUpdating) {
@@ -20,24 +44,46 @@ async function updateStatus(client: Client): Promise<void> {
   isUpdating = true;
 
   try {
-    const teamStatus = await team_get_status();
-    console.log(`[StatusUpdater] Fetched team status from GitHub (length: ${teamStatus.content.length})`);
-    
-    const blurb = await generateStatusBlurb(teamStatus);
-    console.log(`[StatusUpdater] Generated blurb: "${blurb}"`);
+    console.log('[StatusUpdater] Generating status from GitHub workflow data...');
 
-    // In Discord.js v14, for ActivityType.Custom, the actual text must be in the 'state' property.
-    // The 'name' property is what appears as the activity category (e.g., "Playing <name>").
-    client.user?.setPresence({
-      activities: [
-        {
-          name: 'Team Focus',
-          state: blurb,
-          type: ActivityType.Custom,
-        },
-      ],
-      status: 'online',
-    });
+    const status = await generateStatus();
+    const elapsedStr = status.elapsedMinutes !== null
+      ? ` (elapsed: ${formatElapsedTime(status.elapsedMinutes)})`
+      : '';
+
+    console.log(
+      `[StatusUpdater] Generated status: "${status.blurb}" ` +
+      `[${activityTypeToString(status.activityType)}]${elapsedStr}`
+    );
+
+    // Build presence based on activity type
+    // For Custom type, use state field; for others, use name field
+    if (status.activityType === ActivityType.Custom) {
+      // Custom status: shows the state text directly
+      client.user?.setPresence({
+        activities: [
+          {
+            name: 'Team Focus',
+            state: status.blurb,
+            type: ActivityType.Custom,
+          },
+        ],
+        status: 'online',
+      });
+    } else {
+      // Playing/Watching/Competing/Listening: shows as "[Type] {name}"
+      // e.g., "Playing Alex building #42 (8m)"
+      client.user?.setPresence({
+        activities: [
+          {
+            name: status.activityName,
+            type: status.activityType,
+          },
+        ],
+        status: 'online',
+      });
+    }
+
     console.log('[StatusUpdater] Discord presence updated successfully');
   } catch (error) {
     console.error('[StatusUpdater] Failed to update status:', error);
@@ -51,6 +97,7 @@ async function updateStatus(client: Client): Promise<void> {
             type: ActivityType.Custom,
           },
         ],
+        status: 'online',
       });
     } catch (fallbackError) {
       console.error('[StatusUpdater] Fallback status also failed:', fallbackError);

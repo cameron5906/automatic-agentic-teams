@@ -3,8 +3,14 @@ name: Tech Debt Pipeline
 on:
   schedule:
     # Runs daily at 7 PM UTC
-    - cron: '0 19 * * *'
+    - cron: "0 19 * * *"
   workflow_dispatch:
+
+# If you want this to share the same global lock as Issue Pipeline, keep this name.
+# If you want it independent, change group to "tech-debt-pipeline".
+concurrency:
+  group: issue-pipeline-global
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -14,26 +20,25 @@ env:
   SHARED_CONTEXT_PATH: working/agents/SHARED.md
 
 jobs:
-  # ============================================================================
-  # STAGE 1: CURATOR
-  # Reviews SHARED.md, validates items, selects up to 2 for issue creation
-  # ============================================================================
-  curate-debt:
+  curate_debt:
     name: Curate Technical Debt
     runs-on: ubuntu-latest
     outputs:
       items_to_process: ${{ steps.parse.outputs.items }}
       items_count: ${{ steps.parse.outputs.count }}
       has_items: ${{ steps.parse.outputs.has_items }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 50
+          ref: main
+          fetch-depth: 0
           token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
 
       - name: Configure git
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -41,16 +46,16 @@ jobs:
         id: check
         run: |
           if [ -f "${{ env.SHARED_CONTEXT_PATH }}" ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Setup Node.js
         if: steps.check.outputs.exists == 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
       - name: Build MCP Discord
         if: steps.check.outputs.exists == 'true'
@@ -71,162 +76,233 @@ jobs:
                 "env": {
                   "DISCORD_WEBHOOK_URL": "${{ secrets.DISCORD_DEV_WEBHOOK_URL }}",
                   "DISCORD_DEFAULT_CHANNEL_ID": "${{ vars.DISCORD_DEV_CHANNEL_ID || '1453129264118370434' }}",
-                  "AGENT_NAME": "debt-curator"
+                  "AGENT_NAME": "Quinn - Cleanup"
                 }
               }
             }
           }
           EOF
 
+      - name: Write curator output schema (and emit compact JSON for --json-schema)
+        id: schema
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          cat > /tmp/debt_curator.schema.json << 'SCHEMA'
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "items_reviewed",
+              "items_removed_invalid",
+              "items_selected",
+              "changes_made_to_shared",
+              "summary"
+            ],
+            "properties": {
+              "items_reviewed": { "type": "integer", "minimum": 0 },
+              "items_removed_invalid": { "type": "integer", "minimum": 0 },
+              "items_selected": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "title",
+                    "category",
+                    "priority",
+                    "description",
+                    "original_entry",
+                    "found_by",
+                    "found_date",
+                    "found_in_issue",
+                    "affected_files",
+                    "suggested_approach"
+                  ],
+                  "properties": {
+                    "title": { "type": "string" },
+                    "category": {
+                      "type": "string",
+                      "enum": ["tech_debt", "bug", "security", "infrastructure", "ux"]
+                    },
+                    "priority": {
+                      "type": "string",
+                      "enum": ["critical", "high", "medium", "low"]
+                    },
+                    "description": { "type": "string" },
+                    "original_entry": { "type": "string" },
+                    "found_by": { "type": "string" },
+                    "found_date": { "type": "string" },
+                    "found_in_issue": {
+                      "anyOf": [{ "type": "string" }, { "type": "null" }]
+                    },
+                    "affected_files": { "type": "array", "items": { "type": "string" } },
+                    "suggested_approach": { "type": "string" }
+                  }
+                }
+              },
+              "changes_made_to_shared": { "type": "boolean" },
+              "summary": { "type": "string" }
+            }
+          }
+          SCHEMA
+
+          echo "schema=$(jq -c . /tmp/debt_curator.schema.json)" >> "$GITHUB_OUTPUT"
+
       - name: Run debt curator
         id: curator
         if: steps.check.outputs.exists == 'true'
-        uses: anthropics/claude-code-action@beta
+        uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
-          claude_args: --mcp-config /tmp/mcp-config.json
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --mcp-config /tmp/mcp-config.json
+            --model claude-opus-4-5-20251101
+            --max-turns 6000
+            --output-format json
+            --permission-mode bypassPermissions
+            --json-schema '${{ steps.schema.outputs.schema }}'
           prompt: |
             # Technical Debt Curator
 
-            You are the Technical Debt Curator. Your daily job is to review the shared context file and identify items that should be converted into GitHub issues for the team to work on.
+            Read `${{ env.SHARED_CONTEXT_PATH }}`, validate entries, select up to 2 for issue creation, update and commit SHARED.md if needed.
 
             ## Your Task
+            1. Read the shared context file at `${{ env.SHARED_CONTEXT_PATH }}`
 
-            1. **Read the shared context file** at `${{ env.SHARED_CONTEXT_PATH }}`
+            2. Validate existing items:
+               - Check if still relevant by examining the codebase
+               - Verify referenced code/files still exist
+               - Confirm it hasn't already been fixed
+               - Remove items no longer valid
 
-            2. **Validate existing items**: For each item in the document:
-               - Check if the item is still relevant by examining the codebase
-               - Verify the referenced code/files still exist
-               - Confirm the issue hasn't already been fixed
-               - Remove items that are no longer valid (already fixed, stale, or no longer applicable)
+            3. Select up to 2 items for issue creation based on priority/impact/effort/age.
 
-            3. **Select items for issue creation**: Choose up to 2 items based on:
-               - **Priority**: Security concerns > Critical bugs > Tech debt > Improvements
-               - **Impact**: How many areas of the codebase are affected
-               - **Effort**: Prefer items that can be reasonably addressed in a single PR
-               - **Age**: Older items should be addressed before newer ones (check dates)
+            4. Update SHARED.md:
+               - Remove selected items
+               - Remove invalid items
+               - Move resolved items to Archive
+               - Update "Last Updated"
 
-            4. **Update SHARED.md**:
-               - Remove any items you're selecting for issue creation
-               - Remove any items that are no longer valid
-               - Move resolved items to the Archive section
-               - Update the "Last Updated" timestamp
+            5. Commit changes to SHARED.md if any modifications were made
 
-            5. **Commit your changes** to SHARED.md if any modifications were made
+            Output ONLY the JSON object matching the schema (no markdown fences, no extra text).
 
-            ## Discord Updates
+      - name: Push SHARED.md commit (if any)
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
 
-            You have access to the `discord_post_dev_update` MCP tool. Post updates for:
-            - **progress**: When you identify items to process
-            - **tech_debt**: Notable observations about the debt backlog
-            - **thinking**: Significant decisions about prioritization
+          # If Claude left changes uncommitted, fail loudly (otherwise you silently lose edits)
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Working tree is dirty; curator did not commit changes as instructed."
+            git status
+            exit 1
+          fi
 
-            ## Output Format
-
-            You MUST output a JSON object with this structure:
-
-            ```json
-            {
-              "items_reviewed": 0,
-              "items_removed_invalid": 0,
-              "items_selected": [
-                {
-                  "title": "Brief title for the issue",
-                  "category": "tech_debt|bug|security|infrastructure|ux",
-                  "priority": "critical|high|medium|low",
-                  "description": "Full description of the issue",
-                  "original_entry": "The original text from SHARED.md",
-                  "found_by": "agent-name",
-                  "found_date": "YYYY-MM-DD",
-                  "found_in_issue": "#number or null",
-                  "affected_files": ["list", "of", "files"],
-                  "suggested_approach": "How to address this"
-                }
-              ],
-              "changes_made_to_shared": true,
-              "summary": "Brief summary of curation session"
-            }
-            ```
-
-            If no items exist or SHARED.md is empty, output:
-            ```json
-            {
-              "items_reviewed": 0,
-              "items_removed_invalid": 0,
-              "items_selected": [],
-              "changes_made_to_shared": false,
-              "summary": "No items to process in SHARED.md"
-            }
-            ```
-
-            Output ONLY the JSON, no additional text.
+          git pull --rebase origin main
+          git push origin main
 
       - name: Parse curator output
         id: parse
-        if: steps.check.outputs.exists == 'true'
         uses: actions/github-script@v7
+        env:
+          RAW_STRUCTURED: ${{ steps.curator.outputs.structured_output }}
+          RAW_RESULT: ${{ steps.curator.outputs.result }}
+          SHARED_EXISTS: ${{ steps.check.outputs.exists }}
         with:
           script: |
-            const output = `${{ steps.curator.outputs.result }}`;
-            try {
-              const jsonMatch = output.match(/```json\s*([\s\S]*?)\s*```/) || output.match(/\{[\s\S]*\}/);
-              const jsonStr = jsonMatch ? (jsonMatch[1] || jsonMatch[0]) : '{}';
-              const result = JSON.parse(jsonStr);
+            const rawStructured = (process.env.RAW_STRUCTURED || '').trim();
+            const rawResult = (process.env.RAW_RESULT || '').trim();
+            const sharedExists = (process.env.SHARED_EXISTS || 'false') === 'true';
+            const raw = rawStructured || rawResult;
 
-              const items = result.items_selected || [];
-              const count = items.length;
+            const tryParse = (s) => { try { return JSON.parse(s); } catch { return null; } };
 
-              core.setOutput('items', JSON.stringify(items));
-              core.setOutput('count', count);
-              core.setOutput('has_items', count > 0);
-            } catch (e) {
-              console.log('Failed to parse curator output:', e.message);
-              core.setOutput('items', '[]');
-              core.setOutput('count', 0);
-              core.setOutput('has_items', false);
+            function stripFences(s) {
+              return (s || '')
+                .replace(/```json\s*([\s\S]*?)\s*```/i, '$1')
+                .replace(/```\s*([\s\S]*?)\s*```/i, '$1')
+                .trim();
             }
+
+            let payload = null;
+
+            if (raw) {
+              // Preferred: structured_output is already the final JSON
+              payload = tryParse(raw);
+
+              // Fallback: try to extract a JSON object
+              if (!payload) {
+                const cleaned = stripFences(raw)
+                  .replace(/<thinking[\s\S]*?<\/thinking>/gi, "")
+                  .replace(/<analysis[\s\S]*?<\/analysis>/gi, "")
+                  .trim();
+                const start = cleaned.indexOf("{");
+                const end = cleaned.lastIndexOf("}");
+                if (start !== -1 && end !== -1 && end > start) {
+                  payload = tryParse(cleaned.slice(start, end + 1));
+                }
+              }
+            }
+
+            if (!payload) {
+              payload = {
+                items_reviewed: 0,
+                items_removed_invalid: 0,
+                items_selected: [],
+                changes_made_to_shared: false,
+                summary: sharedExists
+                  ? "Failed to parse curator output; treating as no actionable items."
+                  : "No items to process in SHARED.md (file missing)."
+              };
+            }
+
+            const items = payload.items_selected || [];
+            core.setOutput('items', JSON.stringify(items));
+            core.setOutput('count', String(items.length));
+            core.setOutput('has_items', String(items.length > 0));
 
       - name: No items found
         if: steps.check.outputs.exists == 'false'
         run: |
           echo "SHARED.md does not exist. Nothing to process."
 
-  # ============================================================================
-  # STAGE 2: ISSUE CREATION
-  # Creates GitHub issues for selected debt items
-  # ============================================================================
-  create-issues:
+  create_issues:
     name: Create Issues
-    needs: curate-debt
-    if: needs.curate-debt.outputs.has_items == 'true'
+    needs: curate_debt
+    if: needs.curate_debt.outputs.has_items == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: main
+          fetch-depth: 0
           token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
 
       - name: Create issues
         uses: actions/github-script@v7
+        env:
+          ITEMS_JSON: ${{ needs.curate_debt.outputs.items_to_process }}
         with:
           github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
           script: |
-            const items = JSON.parse('${{ needs.curate-debt.outputs.items }}');
+            const items = JSON.parse(process.env.ITEMS_JSON || '[]');
 
             const labelMap = {
-              'tech_debt': ['tech-debt', 'automated'],
-              'bug': ['bug', 'automated'],
-              'security': ['security', 'automated', 'priority:high'],
-              'infrastructure': ['infrastructure', 'automated'],
-              'ux': ['ux', 'automated']
+              tech_debt: ['tech-debt', 'automated'],
+              bug: ['bug', 'automated'],
+              security: ['security', 'automated', 'priority:high'],
+              infrastructure: ['infrastructure', 'automated'],
+              ux: ['ux', 'automated']
             };
 
             const priorityLabels = {
-              'critical': 'priority:critical',
-              'high': 'priority:high',
-              'medium': 'priority:medium',
-              'low': 'priority:low'
+              critical: 'priority:critical',
+              high: 'priority:high',
+              medium: 'priority:medium',
+              low: 'priority:low'
             };
 
             for (const item of items) {
@@ -235,102 +311,61 @@ jobs:
                 priorityLabels[item.priority] || 'priority:medium'
               ];
 
-              const body = `## Description
+              const affectedFiles = (item.affected_files?.length)
+                ? item.affected_files.map(f => `- \`${f}\``).join('\n')
+                : '_Unknown_';
 
-            ${item.description}
+              const relatedIssueLine = item.found_in_issue
+                ? `- **Related issue:** ${item.found_in_issue}\n`
+                : '';
 
-            ## Context
+              const body = [
+                '## Description',
+                '',
+                item.description || '',
+                '',
+                '## Context',
+                '',
+                `- **Category:** ${item.category}`,
+                `- **Priority:** ${item.priority}`,
+                `- **Originally found by:** ${item.found_by}`,
+                `- **Found on:** ${item.found_date}`,
+                relatedIssueLine.trimEnd(),
+                '',
+                '## Affected Files',
+                '',
+                affectedFiles,
+                '',
+                '## Suggested Approach',
+                '',
+                item.suggested_approach || '_No specific approach suggested_',
+                '',
+                '---',
+                '',
+                '> 🤖 This issue was automatically created by the Tech Debt Pipeline from entries in `working/agents/SHARED.md`'
+              ].filter(Boolean).join('\n');
 
-            - **Category:** ${item.category}
-            - **Priority:** ${item.priority}
-            - **Originally found by:** ${item.found_by}
-            - **Found on:** ${item.found_date}
-            ${item.found_in_issue ? `- **Related issue:** ${item.found_in_issue}` : ''}
+              const { data: issue } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[Tech Debt] ${item.title}`,
+                body,
+                labels
+              });
 
-            ## Affected Files
-
-            ${item.affected_files?.map(f => `- \`${f}\``).join('\n') || '_Unknown_'}
-
-            ## Suggested Approach
-
-            ${item.suggested_approach || '_No specific approach suggested_'}
-
-            ---
-
-            > 🤖 This issue was automatically created by the Tech Debt Pipeline from entries in \`working/agents/SHARED.md\`
-            `;
-
-              try {
-                const { data: issue } = await github.rest.issues.create({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  title: `[Tech Debt] ${item.title}`,
-                  body: body,
-                  labels: labels
-                });
-
-                console.log(`Created issue #${issue.number}: ${item.title}`);
-              } catch (error) {
-                console.error(`Failed to create issue for "${item.title}":`, error.message);
-              }
+              console.log(`Created issue #${issue.number}: ${item.title}`);
             }
 
-  # ============================================================================
-  # STAGE 3: SUMMARY
-  # Posts summary to Discord
-  # ============================================================================
   summary:
     name: Pipeline Summary
-    needs: [curate-debt, create-issues]
-    if: always() && needs.curate-debt.result == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Build MCP Discord
-        working-directory: tools/mcp-discord
-        run: |
-          npm ci
-          npm run build
-
-      - name: Create MCP config
-        run: |
-          cat > /tmp/mcp-config.json << EOF
-          {
-            "mcpServers": {
-              "discord": {
-                "command": "node",
-                "args": ["${{ github.workspace }}/tools/mcp-discord/dist/index.js"],
-                "env": {
-                  "DISCORD_WEBHOOK_URL": "${{ secrets.DISCORD_DEV_WEBHOOK_URL }}",
-                  "DISCORD_DEFAULT_CHANNEL_ID": "${{ vars.DISCORD_DEV_CHANNEL_ID || '1453129264118370434' }}",
-                  "AGENT_NAME": "debt-curator"
-                }
-              }
-            }
-          }
-          EOF
-
-      - name: Post summary
-        uses: anthropics/claude-code-action@beta
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
-          claude_args: --mcp-config /tmp/mcp-config.json
-          prompt: |
-            Post a brief summary to Discord using the `discord_post_dev_update` tool with category "progress".
-
-            Items processed: ${{ needs.curate-debt.outputs.items_count }}
-            Issues created: ${{ needs.create-issues.result == 'success' && needs.curate-debt.outputs.items_count || '0' }}
-
-            Keep the message concise (1-2 sentences). Example:
-            "Daily debt review complete: processed 2 items from the backlog and created issues for them."
-
-            If no items were processed, say something like:
-            "Daily debt review complete: no actionable items in the backlog today."
+    needs: [curate_debt, create_issues]
+    if: always() && needs.curate_debt.result == 'success'
+    uses: ./.github/workflows/discord-gpt-message.yml
+    with:
+      webhook_username: "Quinn - Cleanup"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=QuinnCleanup"
+      prompt: |
+        finished debt review. processed ${{ needs.curate_debt.outputs.items_count }} items, created ${{ needs.create_issues.result == 'success' && needs.curate_debt.outputs.items_count || '0' }} issues
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}

@@ -6,7 +6,9 @@
       "Bash(ls -la \"C:\\Users\\camer\\Documents\\Projects\\github-auto-team\\working\\agents\\memory\"\" 2>/dev/null || echo \"No memory directory found \")",
       "Bash(git init:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(git checkout:*)",
+      "Bash(git push:*)"
     ]
   }
 }

@@ -1,0 +1,338 @@
+# Release Notes Generator
+# Automatically generates changelog from PRs merged since last release
+# See: docs/automation/release-notes.md
+
+name: Release Notes Generator
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to generate release notes for (e.g., v1.2.0)"
+        required: true
+        type: string
+      previous_tag:
+        description: "Previous tag to compare against (optional, auto-detected if empty)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  # ============================================================================
+  # Collect changes since last release
+  # ============================================================================
+  collect-changes:
+    name: Collect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      current_tag: ${{ steps.tags.outputs.current }}
+      previous_tag: ${{ steps.tags.outputs.previous }}
+      prs_json: ${{ steps.prs.outputs.json }}
+      pr_count: ${{ steps.prs.outputs.count }}
+      breaking_changes: ${{ steps.categorize.outputs.breaking }}
+      features: ${{ steps.categorize.outputs.features }}
+      fixes: ${{ steps.categorize.outputs.fixes }}
+      other: ${{ steps.categorize.outputs.other }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine tags
+        id: tags
+        run: |
+          set -euo pipefail
+
+          if [ -n "${{ inputs.tag }}" ]; then
+            CURRENT_TAG="${{ inputs.tag }}"
+          else
+            CURRENT_TAG="${GITHUB_REF#refs/tags/}"
+          fi
+
+          echo "current=$CURRENT_TAG" >> "$GITHUB_OUTPUT"
+          echo "Current tag: $CURRENT_TAG"
+
+          if [ -n "${{ inputs.previous_tag }}" ]; then
+            PREVIOUS_TAG="${{ inputs.previous_tag }}"
+          else
+            # Find the previous tag (most recent tag before current)
+            PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | grep -v "$CURRENT_TAG" | head -n1 || echo "")
+          fi
+
+          echo "previous=$PREVIOUS_TAG" >> "$GITHUB_OUTPUT"
+          echo "Previous tag: $PREVIOUS_TAG"
+
+      - name: Get PRs between tags
+        id: prs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const currentTag = '${{ steps.tags.outputs.current }}';
+            const previousTag = '${{ steps.tags.outputs.previous }}';
+
+            let commits;
+
+            if (previousTag) {
+              // Compare commits between tags
+              const { data: comparison } = await github.rest.repos.compareCommits({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                base: previousTag,
+                head: currentTag
+              });
+              commits = comparison.commits;
+            } else {
+              // First release - get all commits
+              const { data: allCommits } = await github.rest.repos.listCommits({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100
+              });
+              commits = allCommits;
+            }
+
+            console.log(`Found ${commits.length} commits between ${previousTag || 'beginning'} and ${currentTag}`);
+
+            // Find PRs associated with these commits
+            const prNumbers = new Set();
+            for (const commit of commits) {
+              // Extract PR number from merge commit message
+              const prMatch = commit.commit.message.match(/#(\d+)/);
+              if (prMatch) {
+                prNumbers.add(parseInt(prMatch[1]));
+              }
+              
+              // Also try to find associated PRs via API
+              try {
+                const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  commit_sha: commit.sha
+                });
+                for (const pr of prs) {
+                  prNumbers.add(pr.number);
+                }
+              } catch (e) {
+                // Ignore errors for individual commits
+              }
+            }
+
+            // Fetch full PR details
+            const prs = [];
+            for (const prNumber of prNumbers) {
+              try {
+                const { data: pr } = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber
+                });
+                if (pr.merged_at) {
+                  prs.push({
+                    number: pr.number,
+                    title: pr.title,
+                    body: pr.body || '',
+                    author: pr.user.login,
+                    labels: pr.labels.map(l => l.name),
+                    merged_at: pr.merged_at
+                  });
+                }
+              } catch (e) {
+                console.log(`Could not fetch PR #${prNumber}: ${e.message}`);
+              }
+            }
+
+            console.log(`Found ${prs.length} merged PRs`);
+
+            core.setOutput('json', JSON.stringify(prs));
+            core.setOutput('count', prs.length);
+
+      - name: Categorize PRs
+        id: categorize
+        uses: actions/github-script@v7
+        env:
+          PRS_JSON: ${{ steps.prs.outputs.json }}
+        with:
+          script: |
+            // Parse PRs from environment variable to avoid template interpolation issues with special characters
+            const prs = JSON.parse(process.env.PRS_JSON || '[]');
+
+            const breaking = [];
+            const features = [];
+            const fixes = [];
+            const other = [];
+
+            for (const pr of prs) {
+              const labels = pr.labels.map(l => l.toLowerCase());
+              const title = pr.title.toLowerCase();
+              
+              if (labels.includes('breaking') || title.includes('breaking')) {
+                breaking.push(pr);
+              } else if (labels.includes('enhancement') || labels.includes('feature') || title.startsWith('feat')) {
+                features.push(pr);
+              } else if (labels.includes('bug') || labels.includes('fix') || title.startsWith('fix')) {
+                fixes.push(pr);
+              } else {
+                other.push(pr);
+              }
+            }
+
+            core.setOutput('breaking', JSON.stringify(breaking));
+            core.setOutput('features', JSON.stringify(features));
+            core.setOutput('fixes', JSON.stringify(fixes));
+            core.setOutput('other', JSON.stringify(other));
+
+            console.log(`Categorized: ${breaking.length} breaking, ${features.length} features, ${fixes.length} fixes, ${other.length} other`);
+
+  # ============================================================================
+  # Generate release notes with AI
+  # ============================================================================
+  generate-notes:
+    name: Generate Release Notes
+    needs: collect-changes
+    runs-on: ubuntu-latest
+    outputs:
+      notes: ${{ steps.generate.outputs.notes }}
+    steps:
+      - name: Generate notes (GPT-4o)
+        id: generate
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CURRENT_TAG: ${{ needs.collect-changes.outputs.current_tag }}
+          PREVIOUS_TAG: ${{ needs.collect-changes.outputs.previous_tag }}
+          PR_COUNT: ${{ needs.collect-changes.outputs.pr_count }}
+          BREAKING: ${{ needs.collect-changes.outputs.breaking_changes }}
+          FEATURES: ${{ needs.collect-changes.outputs.features }}
+          FIXES: ${{ needs.collect-changes.outputs.fixes }}
+          OTHER: ${{ needs.collect-changes.outputs.other }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SYSTEM_PROMPT="You generate professional release notes from PR lists. Use clear, user-focused language. Group by category with emoji headers. Include PR numbers as links. Keep descriptions concise."
+
+          USER_PROMPT=$(cat <<USERPROMPT
+          Generate release notes for ${CURRENT_TAG} (since ${PREVIOUS_TAG:-initial release}).
+          Breaking Changes: ${BREAKING}
+          Features: ${FEATURES}
+          Bug Fixes: ${FIXES}
+          Other Changes: ${OTHER}
+          Format as markdown with version header, highlights, breaking changes, features, fixes, other, and contributors sections.
+          Make PR links like: [#123](https://github.com/${REPO}/pull/123)
+          USERPROMPT
+          )
+
+          cat > /tmp/schema.json <<'SCHEMA'
+          {"type":"object","additionalProperties":false,"required":["notes"],"properties":{"notes":{"type":"string"}}}
+          SCHEMA
+
+          jq -n \
+            --arg model "gpt-4o-2024-08-06" \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg user "$USER_PROMPT" \
+            --slurpfile schema /tmp/schema.json \
+            '{model:$model,store:false,temperature:0.3,max_output_tokens:3000,input:[{role:"system",content:$system},{role:"user",content:$user}],text:{format:{type:"json_schema",name:"release_notes",strict:true,schema:$schema[0]}}}' \
+            > /tmp/openai_request.json
+
+          curl -sS https://api.openai.com/v1/responses \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -d @/tmp/openai_request.json \
+            > /tmp/openai_response.json
+
+          # Extract notes
+          NOTES_JSON="$(jq -r '
+            .output[]
+            | select(.type=="message")
+            | .content[]
+            | select(.type=="output_text")
+            | .text
+          ' /tmp/openai_response.json 2>/dev/null || echo '{}')"
+
+          NOTES=$(echo "$NOTES_JSON" | jq -r '.notes // "Release notes generation failed"')
+
+          DELIM="EOF_$(openssl rand -hex 8)"
+          echo "notes<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$NOTES" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+  # ============================================================================
+  # Create GitHub Release
+  # ============================================================================
+  create-release:
+    name: Create GitHub Release
+    needs: [collect-changes, generate-notes]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Release
+        uses: actions/github-script@v7
+        env:
+          NOTES: ${{ needs.generate-notes.outputs.notes }}
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const tag = '${{ needs.collect-changes.outputs.current_tag }}';
+
+            // Check if release already exists
+            try {
+              const { data: existing } = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: tag
+              });
+              
+              // Update existing release
+              await github.rest.repos.updateRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: existing.id,
+                body: process.env.NOTES
+              });
+              
+              console.log(`Updated existing release for ${tag}`);
+            } catch (e) {
+              if (e.status === 404) {
+                // Create new release
+                await github.rest.repos.createRelease({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  tag_name: tag,
+                  name: tag,
+                  body: process.env.NOTES,
+                  draft: false,
+                  prerelease: tag.includes('-')
+                });
+                
+                console.log(`Created new release for ${tag}`);
+              } else {
+                throw e;
+              }
+            }
+
+  # ============================================================================
+  # Notify Discord
+  # ============================================================================
+  notify-discord:
+    name: Notify Discord
+    needs: [collect-changes, generate-notes, create-release]
+    if: needs.create-release.result == 'success'
+    uses: ./.github/workflows/discord-gpt-message.yml
+    with:
+      webhook_username: "Jordan - PM"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=JordanPM"
+      prompt: |
+        🚀 new release: ${{ needs.collect-changes.outputs.current_tag }}
+
+        ${{ needs.collect-changes.outputs.pr_count }} PRs merged since ${{ needs.collect-changes.outputs.previous_tag || 'initial release' }}
+
+        check it out: https://github.com/${{ github.repository }}/releases/tag/${{ needs.collect-changes.outputs.current_tag }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_PRODUCT_WEBHOOK_URL }}

@@ -47,6 +47,11 @@ export interface MessageContext {
   threadId: string | null;
   images: ImageAttachment[];
   shouldReply?: boolean;
+  /**
+   * When true, indicates this is the first message in a newly created thread.
+   * The agent should consolidate all output into a single follow-up message.
+   */
+  isThreadCreation?: boolean;
 }
 
 
@@ -91,6 +96,32 @@ export interface WorkflowRun {
   conclusion: string | null;
   html_url: string;
   created_at: string;
+}
+
+/**
+ * Represents a job within a workflow run.
+ * Jobs correspond to individual agents or steps in the pipeline.
+ */
+export interface WorkflowJob {
+  id: number;
+  name: string; // e.g., "Run software-engineer (pre)" or "Notify - Alex (Dev)"
+  status: string; // queued, in_progress, completed
+  conclusion: string | null; // success, failure, cancelled, skipped
+  started_at: string | null;
+  html_url: string;
+}
+
+/**
+ * Represents an active agent extracted from workflow job information.
+ * Used for generating meaningful status blurbs.
+ */
+export interface ActiveAgent {
+  name: string; // e.g., "software-engineer"
+  persona: string; // e.g., "Alex - Dev"
+  phase: string; // e.g., "pre", "main", "post", "review", "fix"
+  issueNumber: number | null;
+  runUrl: string;
+  status: 'running' | 'queued' | 'completed';
 }
 
 export interface ToolResult {

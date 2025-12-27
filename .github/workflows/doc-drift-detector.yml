@@ -1,0 +1,301 @@
+# Documentation Drift Detector
+# Weekly check for inconsistencies between code and documentation
+# See: docs/automation/doc-drift-detector.md
+
+name: Documentation Drift Detector
+
+on:
+  schedule:
+    # Wednesday 10 AM UTC
+    - cron: "0 10 * * 3"
+  workflow_dispatch:
+    inputs:
+      create_issues:
+        description: "Create issues for detected drift"
+        required: false
+        type: boolean
+        default: true
+      notify_discord:
+        description: "Post results to Discord"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  # ============================================================================
+  # Analyze documentation drift
+  # ============================================================================
+  analyze-drift:
+    name: Analyze Documentation Drift
+    runs-on: ubuntu-latest
+    outputs:
+      drift_detected: ${{ steps.analyze.outputs.drift_detected }}
+      drift_report: ${{ steps.analyze.outputs.report }}
+      issues_to_create: ${{ steps.analyze.outputs.issues }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Get recent code changes
+        id: changes
+        run: |
+          set -euo pipefail
+
+          # Get files changed in last 7 days
+          SINCE=$(date -d "-7 days" +%Y-%m-%d)
+
+          # Get changed files with their git log
+          CHANGED_FILES=$(git log --since="$SINCE" --name-only --pretty=format: | sort -u | grep -v '^$' || echo "")
+
+          # Categorize changes
+          BACKEND_CHANGES=$(echo "$CHANGED_FILES" | grep -E '^backend/' || echo "")
+          FRONTEND_CHANGES=$(echo "$CHANGED_FILES" | grep -E '^(frontend|webapp)/' || echo "")
+          INFRA_CHANGES=$(echo "$CHANGED_FILES" | grep -E '^infrastructure/' || echo "")
+          API_CHANGES=$(echo "$CHANGED_FILES" | grep -E '(Api|Controller|Endpoint|contracts)' || echo "")
+
+          # Store for analysis
+          DELIM="EOF_$(openssl rand -hex 8)"
+
+          echo "backend<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$BACKEND_CHANGES" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+          echo "frontend<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$FRONTEND_CHANGES" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+          echo "infra<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$INFRA_CHANGES" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+          echo "api<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$API_CHANGES" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+          echo "Recent changes collected"
+
+      - name: Read documentation files
+        id: docs
+        run: |
+          set -euo pipefail
+
+          # Read key documentation files
+          README_CONTENT=""
+          if [ -f "README.md" ]; then
+            README_CONTENT=$(head -200 README.md)
+          fi
+
+          ABOUT_CONTENT=""
+          if [ -f "ABOUT.md" ]; then
+            ABOUT_CONTENT=$(head -200 ABOUT.md)
+          fi
+
+          ARCH_CONTENT=""
+          if [ -f "docs/ARCHITECTURE.md" ]; then
+            ARCH_CONTENT=$(head -300 docs/ARCHITECTURE.md)
+          fi
+
+          API_CONTENT=""
+          if [ -f "docs/API.md" ]; then
+            API_CONTENT=$(head -200 docs/API.md)
+          fi
+
+          DOMAIN_CONTENT=""
+          if [ -f "docs/DOMAIN.md" ]; then
+            DOMAIN_CONTENT=$(head -200 docs/DOMAIN.md)
+          fi
+
+          # Store docs content
+          DELIM="EOF_$(openssl rand -hex 8)"
+
+          echo "readme<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$README_CONTENT" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+          echo "about<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$ABOUT_CONTENT" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+          echo "architecture<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$ARCH_CONTENT" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+          echo "api<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$API_CONTENT" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+          echo "domain<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$DOMAIN_CONTENT" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+      - name: Analyze for drift (GPT-4o)
+        id: analyze
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BACKEND_CHANGES: ${{ steps.changes.outputs.backend }}
+          FRONTEND_CHANGES: ${{ steps.changes.outputs.frontend }}
+          INFRA_CHANGES: ${{ steps.changes.outputs.infra }}
+          API_CHANGES: ${{ steps.changes.outputs.api }}
+          README: ${{ steps.docs.outputs.readme }}
+          ABOUT: ${{ steps.docs.outputs.about }}
+          ARCHITECTURE: ${{ steps.docs.outputs.architecture }}
+          API_DOCS: ${{ steps.docs.outputs.api }}
+          DOMAIN: ${{ steps.docs.outputs.domain }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SYSTEM_PROMPT="You are a documentation drift detector. Analyze recent code changes against existing documentation to find inconsistencies, outdated information, or missing documentation. Focus on API changes, architecture changes, new or removed features. Be specific about what needs updating and where."
+
+          USER_PROMPT=$(cat <<USERPROMPT
+          Analyze documentation drift.
+          Backend changes: ${BACKEND_CHANGES}
+          Frontend changes: ${FRONTEND_CHANGES}
+          Infrastructure changes: ${INFRA_CHANGES}
+          API changes: ${API_CHANGES}
+          README: ${README}
+          ABOUT: ${ABOUT}
+          ARCHITECTURE: ${ARCHITECTURE}
+          API_DOCS: ${API_DOCS}
+          DOMAIN: ${DOMAIN}
+          Identify any documentation drift and specify the file, what is outdated, priority, and suggested fix.
+          USERPROMPT
+          )
+
+          cat > /tmp/schema.json <<'SCHEMA'
+          {"type":"object","additionalProperties":false,"required":["drift_detected","report","issues"],"properties":{"drift_detected":{"type":"boolean"},"report":{"type":"string"},"issues":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["file","description","priority"],"properties":{"file":{"type":"string"},"description":{"type":"string"},"priority":{"type":"string","enum":["high","medium","low"]}}}}}}
+          SCHEMA
+
+          jq -n \
+            --arg model "gpt-4o-2024-08-06" \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg user "$USER_PROMPT" \
+            --slurpfile schema /tmp/schema.json \
+            '{model:$model,store:false,temperature:0.2,max_output_tokens:2000,input:[{role:"system",content:$system},{role:"user",content:$user}],text:{format:{type:"json_schema",name:"drift_analysis",strict:true,schema:$schema[0]}}}' \
+            > /tmp/openai_request.json
+
+          curl -sS https://api.openai.com/v1/responses \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -d @/tmp/openai_request.json \
+            > /tmp/openai_response.json
+
+          ANALYSIS_JSON="$(jq -r '.output[] | select(.type=="message") | .content[] | select(.type=="output_text") | .text' /tmp/openai_response.json 2>/dev/null || echo '{"drift_detected":false,"report":"Analysis failed","issues":[]}')"
+
+          DRIFT_DETECTED=$(echo "$ANALYSIS_JSON" | jq -r '.drift_detected')
+          REPORT=$(echo "$ANALYSIS_JSON" | jq -r '.report')
+          ISSUES=$(echo "$ANALYSIS_JSON" | jq -c '.issues')
+
+          echo "drift_detected=$DRIFT_DETECTED" >> "$GITHUB_OUTPUT"
+
+          DELIM="EOF_$(openssl rand -hex 8)"
+          echo "report<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$REPORT" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+          echo "issues=$ISSUES" >> "$GITHUB_OUTPUT"
+
+          echo "Drift detected: $DRIFT_DETECTED"
+
+  # ============================================================================
+  # Create issues for detected drift
+  # ============================================================================
+  create-issues:
+    name: Create Issues
+    needs: analyze-drift
+    if: |
+      needs.analyze-drift.outputs.drift_detected == 'true' &&
+      (inputs.create_issues == true || inputs.create_issues == null)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create drift issues
+        uses: actions/github-script@v7
+        env:
+          ISSUES_JSON: ${{ needs.analyze-drift.outputs.issues_to_create }}
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const issues = JSON.parse(process.env.ISSUES_JSON || '[]');
+
+            // Filter to high and medium priority only
+            const issueToCreate = issues.filter(i => i.priority !== 'low');
+
+            console.log(`Creating ${issueToCreate.length} issues for documentation drift`);
+
+            for (const issue of issueToCreate) {
+              const title = `[Doc Drift] Update ${issue.file}`;
+              
+              // Check if similar issue already exists
+              const { data: existing } = await github.rest.issues.listForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                labels: 'documentation,drift',
+                per_page: 100
+              });
+              
+              const alreadyExists = existing.some(e => 
+                e.title.includes(issue.file)
+              );
+              
+              if (alreadyExists) {
+                console.log(`Issue for ${issue.file} already exists, skipping`);
+                continue;
+              }
+              
+              const separator = '---';
+              const body = `## Documentation Drift Detected\n\n**File:** \`${issue.file}\`\n**Priority:** ${issue.priority}\n\n### What needs updating\n\n${issue.description}\n\n${separator}\n\n*Automatically detected by Documentation Drift Detector workflow*`;
+
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['documentation', 'drift', `priority:${issue.priority}`]
+              });
+              
+              console.log(`Created issue for ${issue.file}`);
+            }
+
+  # ============================================================================
+  # Notify Discord
+  # ============================================================================
+  notify-discord:
+    name: Notify Discord
+    needs: analyze-drift
+    if: |
+      needs.analyze-drift.outputs.drift_detected == 'true' &&
+      (inputs.notify_discord == true || inputs.notify_discord == null)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    with:
+      webhook_username: "Riley - Docs"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=RileyDocs"
+      prompt: |
+        📚 documentation drift detected this week
+
+        ${{ needs.analyze-drift.outputs.drift_report }}
+
+        issues have been created for the documentation-sheriff to handle
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Report no drift (for visibility)
+  # ============================================================================
+  report-no-drift:
+    name: Report No Drift
+    needs: analyze-drift
+    if: needs.analyze-drift.outputs.drift_detected == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log clean status
+        run: |
+          echo "✅ No documentation drift detected this week"
+          echo "Documentation appears to be in sync with recent code changes"

@@ -6,9 +6,13 @@ on:
   workflow_dispatch:
     inputs:
       issue_number:
-        description: 'Issue number to process'
+        description: "Issue number to process"
         required: true
         type: number
+
+concurrency:
+  group: issue-pipeline-global
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -21,10 +25,6 @@ env:
   ISSUES_PATH: working/issues
 
 jobs:
-  # ============================================================================
-  # STAGE 1: ORCHESTRATION
-  # Analyzes the issue and determines which agents should be activated
-  # ============================================================================
   orchestrate:
     name: Orchestrate Pipeline
     runs-on: ubuntu-latest
@@ -42,7 +42,10 @@ jobs:
       issue_context: ${{ steps.parse.outputs.issue_context }}
       agent_prompts: ${{ steps.parse.outputs.agent_prompts }}
       issue_number: ${{ steps.issue.outputs.number }}
-      issue_file: ${{ steps.seed.outputs.issue_file }}
+      issue_file: ${{ steps.work_branch.outputs.issue_file }}
+      work_branch: ${{ steps.parse.outputs.work_branch }}
+      # Hotfix mode: skip planning agents and fast-track to implementation
+      is_hotfix: ${{ steps.hotfix.outputs.is_hotfix }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -60,12 +63,25 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const issueNumber = context.payload.issue?.number || ${{ inputs.issue_number || 0 }};
+            // issues event: context.payload.issue.number
+            // workflow_dispatch: context.payload.inputs.issue_number
+            const issueNumber = Number(
+              context.payload.issue?.number ??
+              context.payload.inputs?.issue_number ??
+              core.getInput('issue_number') ??
+              0
+            );
+
+            if (!issueNumber) {
+              throw new Error("No issue number found (issues event or workflow_dispatch input required).");
+            }
+
             const { data: issue } = await github.rest.issues.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: issueNumber
             });
+
             core.setOutput('number', issue.number);
             core.setOutput('title', issue.title);
             core.setOutput('body', issue.body || '');
@@ -73,183 +89,25 @@ jobs:
             core.setOutput('author', issue.user.login);
             core.setOutput('created_at', issue.created_at);
 
+      # Detect hotfix mode from issue labels - fast-tracks implementation
+      - name: Detect hotfix mode
+        id: hotfix
+        run: |
+          LABELS="${{ steps.issue.outputs.labels }}"
+          if echo "$LABELS" | grep -qiE '(hotfix|priority:critical)'; then
+            echo "is_hotfix=true" >> "$GITHUB_OUTPUT"
+            echo "🚨 HOTFIX MODE ACTIVATED - Skipping planning agents"
+          else
+            echo "is_hotfix=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Ensure docs directories exist
         run: |
-          # Create docs structure if not exists
-          mkdir -p docs/adr docs/research
-
-          # Seed docs/README.md if not exists
-          if [ ! -f "docs/README.md" ]; then
-            cat << 'DOCS_EOF' > docs/README.md
-          # Documentation
-
-          This directory contains project documentation including architectural decision records and research notes.
-
-          ## Contents
-
-          ### [Architecture Decision Records](./adr/)
-
-          Significant architectural decisions are documented as ADRs.
-
-          | ADR | Title | Status | Date |
-          |-----|-------|--------|------|
-          | _No ADRs yet_ | | | |
-
-          ### [Research](./research/)
-
-          Research documents capture investigation findings and exploratory analysis.
-
-          | Document | Scope | Date |
-          |----------|-------|------|
-          | _No research documents yet_ | | |
-          DOCS_EOF
-          fi
-
-          # Seed docs/adr/README.md if not exists
-          if [ ! -f "docs/adr/README.md" ]; then
-            cat << 'ADR_EOF' > docs/adr/README.md
-          # Architecture Decision Records
-
-          ## Table of Contents
-
-          | ADR | Title | Status | Date |
-          |-----|-------|--------|------|
-          | _No ADRs yet_ | | | |
-
-          ## Filename Format
-
-          `YYYY-MM-DD-short-description.md`
-
-          ## ADR Template
-
-          ```markdown
-          # ADR-XXX: Title
-
-          **Status:** Proposed | Accepted | Deprecated | Superseded
-
-          **Date:** YYYY-MM-DD
-
-          ## Context
-
-          ## Decision
-
-          ## Consequences
-
-          ### Positive
-
-          -
-
-          ### Negative
-
-          -
-
-          ### Neutral
-
-          -
-
-          ## Implementation Checklist
-
-          ### Domain Layer
-
-          - [ ]
-
-          ### Infrastructure Layer
-
-          - [ ]
-
-          ### Jobs Layer
-
-          - [ ]
-
-          ### Tests
-
-          - [ ]
-
-          ### Documentation
-
-          - [ ]
-
-          ## Alternatives Considered
-
-          ### 1.
-
-          ## Invariants
-
-          1.
-
-          ## Related Decisions
-
-          - ADR-
-
-          ## References
-
-          -
-          ```
-          ADR_EOF
-          fi
-
-          # Seed docs/research/README.md if not exists
-          if [ ! -f "docs/research/README.md" ]; then
-            cat << 'RESEARCH_EOF' > docs/research/README.md
-          # Research Documents
-
-          ## Table of Contents
-
-          | Document | Scope | Reviewer | Date |
-          |----------|-------|----------|------|
-          | _No research documents yet_ | | | |
-
-          ## Filename Format
-
-          `YYYY-MM-DD-short-description.md`
-
-          ## Research Template
-
-          ```markdown
-          # Title
-
-          **Date:** YYYY-MM-DD
-          **Reviewer:** Agent or person name
-          **Scope:** Brief description
-
-          ---
-
-          ## Executive Summary
-
-          ---
-
-          ## Findings
-
-          ---
-
-          ## Recommendations
-
-          ---
-
-          ## Files Reviewed
-
-          ### Frontend
-
-          -
-
-          ### Backend Controllers
-
-          -
-
-          ### Backend Pipeline
-
-          -
-
-          ### Backend Core/Infrastructure
-
-          -
-          ```
-          RESEARCH_EOF
-          fi
-
           # Stage any new docs files
+          mkdir -p docs/adr docs/research
           git add docs/ || true
 
+<<<<<<< Updated upstream
       - name: Seed issue context file
         id: seed
         run: |
@@ -319,6 +177,8 @@ jobs:
 
           echo "issue_file=$ISSUE_FILE" >> $GITHUB_OUTPUT
 
+=======
+>>>>>>> Stashed changes
       - name: Load agent definitions
         id: definitions
         run: |
@@ -331,100 +191,376 @@ jobs:
           fi
           echo "agents=$AGENTS_JSON" >> $GITHUB_OUTPUT
 
-      - name: Run orchestrator
-        id: orchestrator
-        uses: anthropics/claude-code-action@beta
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
-          prompt: |
-            You are the Pipeline Orchestrator. Your job is to analyze a GitHub issue and determine which agents should be activated to handle it.
+          node-version: "20"
 
-            ## Issue Details
-            - Number: #${{ steps.issue.outputs.number }}
-            - Title: ${{ steps.issue.outputs.title }}
-            - Body: ${{ steps.issue.outputs.body }}
-            - Labels: ${{ steps.issue.outputs.labels }}
-
-            ## Available Agents
-            ${{ steps.definitions.outputs.agents }}
-
-            ## Agent Roster
-            - documentation-sheriff: Pre/post documentation context and updates
-            - code-reviewer: Reviews code quality and PR approval
-            - infrastructure-engineer: AWS/CDK infrastructure changes
-            - product-owner: Product alignment for new features (references ABOUT.md for business requirements)
-            - project-manager: Team coordination and TEAM.md maintenance
-            - security-engineer: Security planning and code review
-            - software-engineer: Product development and git commits
-            - tech-lead: Architectural planning and bug identification
-            - test-engineer: Test creation and verification
-            - ux-designer: Frontend feature planning
-
-            ## Key Repository Files
-            - **ABOUT.md**: Contains product information, business requirements, and milestones. Planning agents should reference this.
-            - **DEVLOG.md**: Large development log file. To read recent context, grep for "## Session" and read the latest entry.
-            - **working/issues/${{ steps.issue.outputs.number }}*.md**: Issue context file seeded for this pipeline run.
-
-            ## Your Task
-            1. Analyze the issue to understand its scope and requirements
-            2. Review recent git history for context
-            3. Check ABOUT.md for relevant product context
-            4. Grep DEVLOG.md for "## Session" to find the latest session entry for recent work context
-            5. Determine which agents should be activated
-            6. Create specific prompts for each activated agent
-
-            ## Required Output
-            You MUST output a JSON object with exactly this structure:
-            ```json
-            {
-              "issue_context": "Brief summary of what this issue is about",
+      - name: Define orchestrator structured output schema (JSON, not JS)
+        id: orchestrator_schema
+        run: |
+          cat > /tmp/orchestrator_output_schema.json <<'JSON'
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["issue_context","delegation","branch"],
+            "properties": {
+              "issue_context": { "type": "string" },
+              "branch": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type","name"],
+                "properties": {
+                  "type": { "type": "string", "enum": ["feat","fix","chore","docs","refactor","test","ci"] },
+                  "name": { "type": "string" }
+                }
+              },
               "delegation": {
-                "documentation_sheriff": { "activate": boolean, "phase": "pre|post|both", "prompt": "specific task" },
-                "infrastructure_engineer": { "activate": boolean, "phase": "pre|post|both", "prompt": "specific task" },
-                "product_owner": { "activate": boolean, "prompt": "specific task" },
-                "project_manager": { "activate": boolean, "prompt": "specific task" },
-                "security_engineer": { "activate": boolean, "phase": "pre|post|both", "prompt": "specific task" },
-                "software_engineer": { "activate": boolean, "prompt": "specific task" },
-                "tech_lead": { "activate": boolean, "prompt": "specific task" },
-                "test_engineer": { "activate": boolean, "prompt": "specific task" },
-                "ux_designer": { "activate": boolean, "prompt": "specific task" }
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["documentation_sheriff","infrastructure_engineer","product_owner","project_manager","security_engineer","software_engineer","tech_lead","test_engineer","ux_designer"],
+                "properties": {
+                  "documentation_sheriff": { "type":"object","additionalProperties":false,"required":["activate","phase","prompt"],"properties":{"activate":{"type":"boolean"},"phase":{"type":"string","enum":["pre","post","both"]},"prompt":{"type":"string"}}},
+                  "infrastructure_engineer": { "type":"object","additionalProperties":false,"required":["activate","phase","prompt"],"properties":{"activate":{"type":"boolean"},"phase":{"type":"string","enum":["pre","post","both"]},"prompt":{"type":"string"}}},
+                  "security_engineer": { "type":"object","additionalProperties":false,"required":["activate","phase","prompt"],"properties":{"activate":{"type":"boolean"},"phase":{"type":"string","enum":["pre","post","both"]},"prompt":{"type":"string"}}},
+                  "product_owner": { "type":"object","additionalProperties":false,"required":["activate","prompt"],"properties":{"activate":{"type":"boolean"},"prompt":{"type":"string"}}},
+                  "project_manager": { "type":"object","additionalProperties":false,"required":["activate","prompt"],"properties":{"activate":{"type":"boolean"},"prompt":{"type":"string"}}},
+                  "software_engineer": { "type":"object","additionalProperties":false,"required":["activate","prompt"],"properties":{"activate":{"type":"boolean"},"prompt":{"type":"string"}}},
+                  "tech_lead": { "type":"object","additionalProperties":false,"required":["activate","prompt"],"properties":{"activate":{"type":"boolean"},"prompt":{"type":"string"}}},
+                  "test_engineer": { "type":"object","additionalProperties":false,"required":["activate","prompt"],"properties":{"activate":{"type":"boolean"},"prompt":{"type":"string"}}},
+                  "ux_designer": { "type":"object","additionalProperties":false,"required":["activate","prompt"],"properties":{"activate":{"type":"boolean"},"prompt":{"type":"string"}}}
+                }
               }
             }
-            ```
+          }
+          JSON
 
-            Output ONLY the JSON, no additional text.
+          echo "schema=$(jq -c . /tmp/orchestrator_output_schema.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Run orchestrator (OpenAI GPT-4o Structured Output)
+        id: orchestrator
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+          ISSUE_BODY: ${{ steps.issue.outputs.body }}
+          ISSUE_LABELS: ${{ steps.issue.outputs.labels }}
+          AGENTS_JSON: ${{ steps.definitions.outputs.agents }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "OPENAI_API_KEY is missing. Add it as a repo secret."
+            exit 1
+          fi
+
+          # Build the exact same prompt you were giving Claude
+          # Check if hotfix mode is active
+          IS_HOTFIX="${{ steps.hotfix.outputs.is_hotfix }}"
+
+          SYSTEM_PROMPT=$(cat <<EOF
+          You are the Pipeline Orchestrator. Your job is to analyze a GitHub issue and determine which agents should be activated to handle it.
+
+          NON-NEGOTIABLE ROLE BOUNDARY:
+          - You are a ROUTER, not a doer.
+          - Do NOT propose code changes, do NOT implement fixes, do NOT draft patches.
+          - Your only deliverable is the JSON object matching the schema.
+
+          HOTFIX MODE (is_hotfix=${IS_HOTFIX}):
+          If is_hotfix=true, this issue has 'hotfix' or 'priority:critical' labels. In hotfix mode:
+          - Set all planning agent activations to false (product_owner, ux_designer, tech_lead)
+          - Only activate: security_engineer (pre phase only), software_engineer, test_engineer
+          - Use expedited prompts focused on minimal correct fix
+          - Skip documentation_sheriff and infrastructure_engineer unless absolutely necessary
+          - project_manager should still be activated for tracking
+          EOF
+          )
+
+          USER_PROMPT=$(cat <<EOF
+          ## Issue
+          #${ISSUE_NUMBER}: ${ISSUE_TITLE}
+          Labels: ${ISSUE_LABELS}
+
+          Body:
+          ${ISSUE_BODY}
+
+          ## Available Agents (name + path)
+          ${AGENTS_JSON}
+
+          ## Output Rules (must follow)
+          - Return ONLY valid JSON matching the schema.
+          - Planning agents: ONLY update working/issues + working/agents/memory (no code changes)
+          - Implementation/validation agents: may change code + commit.
+          - Choose branch.type and branch.name:
+            - type in: feat|fix|chore|docs|refactor|test|ci
+            - name format: <type>/issue-<number>-<kebab-title> (<= ~80 chars, lowercase, hyphens only)
+          EOF
+          )
+
+          # Compact schema for injection
+          SCHEMA_JSON="$(jq -c . /tmp/orchestrator_output_schema.json)"
+
+          # Build Responses API payload with strict JSON Schema structured output
+          jq -n \
+            --arg model "gpt-4o-2024-08-06" \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg user "$USER_PROMPT" \
+            --argjson schema "$SCHEMA_JSON" \
+            '{
+              model: $model,
+              store: false,
+              temperature: 0,
+              max_output_tokens: 2500,
+              input: [
+                { role: "system", content: $system },
+                { role: "user", content: $user }
+              ],
+              text: {
+                format: {
+                  type: "json_schema",
+                  name: "orchestrator_packet",
+                  strict: true,
+                  schema: $schema
+                }
+              }
+            }' > /tmp/openai_orchestrator_request.json
+
+          # Call OpenAI
+          curl -sS https://api.openai.com/v1/responses \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -d @/tmp/openai_orchestrator_request.json \
+            > /tmp/openai_orchestrator_response.json
+
+          # Surface API errors clearly
+          if jq -e '.error' /tmp/openai_orchestrator_response.json >/dev/null; then
+            echo "OpenAI API error:"
+            jq -r '.error' /tmp/openai_orchestrator_response.json
+            exit 1
+          fi
+
+          # Extract the model's output text (which will be the JSON object)
+          ORCH_TEXT="$(jq -r '
+            .output[]
+            | select(.type=="message")
+            | .content[]
+            | select(.type=="output_text")
+            | .text
+          ' /tmp/openai_orchestrator_response.json)"
+
+          if [ -z "${ORCH_TEXT:-}" ] || [ "${ORCH_TEXT}" = "null" ]; then
+            echo "No output_text found in response:"
+            jq . /tmp/openai_orchestrator_response.json
+            exit 1
+          fi
+
+          # Validate it is JSON and compact it to a single line for safe step outputs
+          echo "$ORCH_TEXT" | jq -e . > /tmp/orchestrator.json
+          ORCH_COMPACT="$(cat /tmp/orchestrator.json | jq -c .)"
+
+          # Emit outputs compatible with your existing parse step
+          echo "structured_output=${ORCH_COMPACT}" >> "$GITHUB_OUTPUT"
+          echo "result=${ORCH_COMPACT}" >> "$GITHUB_OUTPUT"
 
       - name: Parse orchestrator output
         id: parse
         uses: actions/github-script@v7
+        env:
+          RAW_STRUCTURED: ${{ steps.orchestrator.outputs.structured_output }}
+          RAW_RESULT: ${{ steps.orchestrator.outputs.result }}
         with:
           script: |
-            const output = `${{ steps.orchestrator.outputs.result }}`;
-            const jsonMatch = output.match(/\{[\s\S]*\}/);
-            if (!jsonMatch) {
-              throw new Error('Could not parse orchestrator output');
+            const rawStructured = (process.env.RAW_STRUCTURED || '').trim();
+            const rawResult = (process.env.RAW_RESULT || '').trim();
+            const raw = rawStructured || rawResult;
+
+            const tryParse = (s) => {
+              try { return JSON.parse(s); } catch { return null; }
+            };
+
+            // 1) Prefer the action's structured output (should already be clean JSON)
+            let parsed = tryParse(raw);
+
+            // 2) Defensive fallback: strip wrappers and extract first JSON object
+            if (!parsed) {
+              const cleaned = raw
+                .replace(/<thinking[\s\S]*?<\/thinking>/gi, "")
+                .replace(/<analysis[\s\S]*?<\/analysis>/gi, "")
+                .replace(/```(?:json)?/gi, "")
+                .replace(/```/g, "")
+                .trim();
+
+              const start = cleaned.indexOf("{");
+              const end = cleaned.lastIndexOf("}");
+              if (start !== -1 && end !== -1 && end > start) {
+                parsed = tryParse(cleaned.slice(start, end + 1));
+              }
             }
-            const delegation = JSON.parse(jsonMatch[0]);
 
-            core.setOutput('activate_documentation_sheriff', delegation.delegation.documentation_sheriff?.activate || false);
-            core.setOutput('activate_infrastructure_engineer', delegation.delegation.infrastructure_engineer?.activate || false);
-            core.setOutput('activate_product_owner', delegation.delegation.product_owner?.activate || false);
-            core.setOutput('activate_project_manager', delegation.delegation.project_manager?.activate || false);
-            core.setOutput('activate_security_engineer', delegation.delegation.security_engineer?.activate || false);
-            core.setOutput('activate_software_engineer', delegation.delegation.software_engineer?.activate || false);
-            core.setOutput('activate_tech_lead', delegation.delegation.tech_lead?.activate || false);
-            core.setOutput('activate_test_engineer', delegation.delegation.test_engineer?.activate || false);
-            core.setOutput('activate_ux_designer', delegation.delegation.ux_designer?.activate || false);
-            core.setOutput('issue_context', delegation.issue_context);
-            core.setOutput('delegation', JSON.stringify(delegation.delegation));
-            core.setOutput('agent_prompts', JSON.stringify(delegation.delegation));
+            if (!parsed) {
+              throw new Error("Could not find JSON object in orchestrator output.");
+            }
+
+            if (!parsed?.delegation || typeof parsed.issue_context !== "string") {
+              console.log("Parsed object:", parsed);
+              throw new Error("Parsed JSON missing required fields (issue_context, delegation).");
+            }
+
+            const d = parsed.delegation;
+
+            core.setOutput("activate_documentation_sheriff", String(!!d.documentation_sheriff?.activate));
+            core.setOutput("activate_infrastructure_engineer", String(!!d.infrastructure_engineer?.activate));
+            core.setOutput("activate_product_owner", String(!!d.product_owner?.activate));
+            core.setOutput("activate_project_manager", String(!!d.project_manager?.activate));
+            core.setOutput("activate_security_engineer", String(!!d.security_engineer?.activate));
+            core.setOutput("activate_software_engineer", String(!!d.software_engineer?.activate));
+            core.setOutput("activate_tech_lead", String(!!d.tech_lead?.activate));
+            core.setOutput("activate_test_engineer", String(!!d.test_engineer?.activate));
+            core.setOutput("activate_ux_designer", String(!!d.ux_designer?.activate));
+            core.setOutput("work_branch", parsed.branch?.name || "");
+
+            core.setOutput("issue_context", parsed.issue_context);
+            core.setOutput("delegation", JSON.stringify(d));
+            core.setOutput("agent_prompts", JSON.stringify(d));
+
+      - name: Create and push work branch (seed artifacts live here)
+        id: work_branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BRANCH="${{ steps.parse.outputs.work_branch }}"
+          if [ -z "${BRANCH:-}" ]; then
+            echo "No work_branch provided by orchestrator."
+            exit 1
+          fi
+
+          # Create branch from origin/main
+          git fetch origin main
+          git checkout -B "$BRANCH" origin/main
+
+          # Create issue context file on the work branch
+          mkdir -p working/issues
+          SANITIZED_TITLE="$(echo "${{ steps.issue.outputs.title }}" | sed 's/[<>:"|?*\/\\]/_/g')"
+          ISSUE_FILE="working/issues/${{ steps.issue.outputs.number }} ${SANITIZED_TITLE}.md"
+
+          if [ ! -f "$ISSUE_FILE" ]; then
+            cat << EOF > "$ISSUE_FILE"
+          # Issue ${{ steps.issue.outputs.number }}: ${{ steps.issue.outputs.title }}
+
+          ** Author:** ${{ steps.issue.outputs.author }}
+          ** Created:** ${{ steps.issue.outputs.created_at }}
+          ** Labels:** ${{ steps.issue.outputs.labels }}
+
+          # Original Description
+          ${{ steps.issue.outputs.body }}
+
+
+          ---
+          ## Pipeline Context
+          _Populated by agents._
+          EOF
+          fi
+
+          echo "issue_file=$ISSUE_FILE" >> "$GITHUB_OUTPUT"
+
+          # Commit whatever the orchestrator seeded (docs + working/issues file)
+          git add docs/ working/issues || true
+
+          # Helper function for robust push with retry
+          push_with_retry() {
+            local max_retries=3
+            local retry_delay=2
+            
+            for attempt in $(seq 1 $max_retries); do
+              echo "Push attempt $attempt of $max_retries..."
+              
+              # For initial branch creation, use force-with-lease to handle re-runs
+              if git push -u --force-with-lease origin "$BRANCH" 2>&1; then
+                echo "Push succeeded on attempt $attempt"
+                return 0
+              fi
+              
+              if [ "$attempt" -eq "$max_retries" ]; then
+                echo "ERROR: Push failed after $max_retries attempts"
+                return 1
+              fi
+              
+              echo "Push failed, retrying in ${retry_delay}s..."
+              sleep "$retry_delay"
+              retry_delay=$((retry_delay * 2))
+            done
+          }
+
+          if git diff --cached --quiet; then
+            echo "No seeded changes to commit (branch will still be created)."
+            # still push branch so agents can check it out
+            push_with_retry
+            exit 0
+          fi
+
+          git commit -m "chore: seed issue context for #${{ steps.issue.outputs.number }}"
+          push_with_retry
+
+      - name: Write orchestrator packet (artifact)
+        env:
+          ORCH_JSON: ${{ steps.orchestrator.outputs.structured_output }}
+        run: |
+          set -euo pipefail
+          mkdir -p .orchestrator
+          # Write exactly what the action produced
+          printf "%s" "${ORCH_JSON}" > .orchestrator/orchestrator.json
+
+      - name: Upload orchestrator packet
+        uses: actions/upload-artifact@v4
+        with:
+          name: orchestrator-${{ steps.issue.outputs.number }}
+          path: .orchestrator/orchestrator.json
+          retention-days: 1
 
   # ============================================================================
-  # STAGE 2: PRE-WORK AGENTS
-  # Agents that need to run before main development work
+  # HOTFIX MODE NOTIFICATION
   # ============================================================================
-  pre-documentation:
+  hotfix-notify:
+    name: Notify - Hotfix Mode
+    needs: orchestrate
+    if: needs.orchestrate.outputs.is_hotfix == 'true'
+    uses: ./.github/workflows/discord-gpt-message.yml
+    with:
+      webhook_username: "Alex - Dev"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=AlexDev"
+      prompt: |
+        🚨 hotfix triggered for #${{ needs.orchestrate.outputs.issue_number }}
+
+        fast-tracking - skipping planning phase, going straight to implementation
+
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # STAGE 2: pre_WORK AGENTS
+  # ============================================================================
+  pre_documentation_notify:
+    name: Notify - Documentation Sheriff (Pre)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    needs: [orchestrate]
+    if: |
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_documentation_sheriff == 'true'
+    with:
+      webhook_username: "Riley - Docs"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=RileyDocs"
+      prompt: |
+        picking up issue #${{ needs.orchestrate.outputs.issue_number }}, checking what docs we have that might be relevant
+
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  pre_documentation:
     name: Documentation Sheriff (Pre)
     needs: orchestrate
     if: needs.orchestrate.outputs.activate_documentation_sheriff == 'true'
@@ -435,9 +571,31 @@ jobs:
       issue_number: ${{ needs.orchestrate.outputs.issue_number }}
       issue_context: ${{ needs.orchestrate.outputs.issue_context }}
       agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
     secrets: inherit
 
-  pre-infrastructure:
+  pre_infrastructure_notify:
+    name: Notify - Infrastructure Engineer (Pre)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    needs: [orchestrate, pre_documentation]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_infrastructure_engineer == 'true' &&
+      (needs.pre_documentation.result == 'success' || needs.pre_documentation.result == 'skipped')
+    with:
+      webhook_username: "Sam - Infra"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=SamInfra"
+      prompt: |
+        picking up #${{ needs.orchestrate.outputs.issue_number }}, gonna scope out infra requirements
+
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+        docs notes: ${{ needs.pre_documentation.outputs.result || 'n/a' }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  pre_infrastructure:
     name: Infrastructure Engineer (Pre)
     needs: orchestrate
     if: needs.orchestrate.outputs.activate_infrastructure_engineer == 'true'
@@ -448,9 +606,33 @@ jobs:
       issue_number: ${{ needs.orchestrate.outputs.issue_number }}
       issue_context: ${{ needs.orchestrate.outputs.issue_context }}
       agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
     secrets: inherit
 
-  pre-security:
+  pre_security_notify:
+    name: Notify - Security Engineer (Pre)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    needs: [orchestrate, pre_documentation, pre_infrastructure]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_security_engineer == 'true' &&
+      (needs.pre_documentation.result == 'success' || needs.pre_documentation.result == 'skipped') &&
+      (needs.pre_infrastructure.result == 'success' || needs.pre_infrastructure.result == 'skipped')
+    with:
+      webhook_username: "Casey - Security"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=CaseySec"
+      prompt: |
+        looking at #${{ needs.orchestrate.outputs.issue_number }} from a security angle now
+
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+        docs notes: ${{ needs.pre_documentation.outputs.result || 'n/a' }}
+        infra notes: ${{ needs.pre_infrastructure.outputs.result || 'n/a' }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  pre_security:
     name: Security Engineer (Pre)
     needs: orchestrate
     if: needs.orchestrate.outputs.activate_security_engineer == 'true'
@@ -461,18 +643,47 @@ jobs:
       issue_number: ${{ needs.orchestrate.outputs.issue_number }}
       issue_context: ${{ needs.orchestrate.outputs.issue_context }}
       agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
     secrets: inherit
 
   # ============================================================================
   # STAGE 3: PLANNING AGENTS
-  # Product, UX, and Tech Lead planning before development
   # ============================================================================
-  planning-product:
-    name: Product Owner
-    needs: [orchestrate, pre-documentation, pre-infrastructure, pre-security]
+  pre_product_owner_notify:
+    name: Notify - Product Owner (Pre)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    needs: [orchestrate, pre_documentation, pre_infrastructure, pre_security]
+    # Skip in hotfix mode
     if: |
       always() &&
       needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.is_hotfix != 'true' &&
+      needs.orchestrate.outputs.activate_product_owner == 'true' &&
+      (needs.pre_documentation.result == 'success' || needs.pre_documentation.result == 'skipped') &&
+      (needs.pre_infrastructure.result == 'success' || needs.pre_infrastructure.result == 'skipped') &&
+      (needs.pre_security.result == 'success' || needs.pre_security.result == 'skipped')
+    with:
+      webhook_username: "Morgan - Product"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=MorganPO"
+      prompt: |
+        reviewing product requirements for #${{ needs.orchestrate.outputs.issue_number }}
+
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+        docs notes: ${{ needs.pre_documentation.outputs.result || 'n/a' }}
+        infra notes: ${{ needs.pre_infrastructure.outputs.result || 'n/a' }}
+        security notes: ${{ needs.pre_security.outputs.result || 'n/a' }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  planning_product:
+    name: Product Owner
+    needs: [orchestrate, pre_documentation, pre_infrastructure, pre_security]
+    # Skip in hotfix mode - fast-track to implementation
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.is_hotfix != 'true' &&
       needs.orchestrate.outputs.activate_product_owner == 'true'
     uses: ./.github/workflows/agent-step.yml
     with:
@@ -481,14 +692,47 @@ jobs:
       issue_number: ${{ needs.orchestrate.outputs.issue_number }}
       issue_context: ${{ needs.orchestrate.outputs.issue_context }}
       agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
     secrets: inherit
 
-  planning-ux:
-    name: UX Designer
-    needs: [orchestrate, pre-documentation, pre-infrastructure, pre-security]
+  pre_ux_designer_notify:
+    name: Notify - UX Designer (Pre)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    needs:
+      [
+        orchestrate,
+        pre_documentation,
+        pre_infrastructure,
+        pre_security,
+        planning_product,
+      ]
+    # Skip in hotfix mode
     if: |
       always() &&
       needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.is_hotfix != 'true' &&
+      needs.orchestrate.outputs.activate_ux_designer == 'true' &&
+      (needs.planning_product.result == 'success' || needs.planning_product.result == 'skipped')
+    with:
+      webhook_username: "Drew - UX"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=DrewUX"
+      prompt: |
+        thinking through ux for #${{ needs.orchestrate.outputs.issue_number }}
+
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+        product notes: ${{ needs.planning_product.outputs.result || 'n/a' }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  planning_ux:
+    name: UX Designer
+    needs: [orchestrate, pre_documentation, pre_infrastructure, pre_security]
+    # Skip in hotfix mode - fast-track to implementation
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.is_hotfix != 'true' &&
       needs.orchestrate.outputs.activate_ux_designer == 'true'
     uses: ./.github/workflows/agent-step.yml
     with:
@@ -497,14 +741,50 @@ jobs:
       issue_number: ${{ needs.orchestrate.outputs.issue_number }}
       issue_context: ${{ needs.orchestrate.outputs.issue_context }}
       agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
     secrets: inherit
 
-  planning-tech-lead:
-    name: Tech Lead
-    needs: [orchestrate, pre-documentation, pre-infrastructure, pre-security]
+  pre_tech_lead_notify:
+    name: Notify - Tech Lead (Pre)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    needs:
+      [
+        orchestrate,
+        pre_documentation,
+        pre_infrastructure,
+        pre_security,
+        planning_product,
+        planning_ux,
+      ]
+    # Skip in hotfix mode
     if: |
       always() &&
       needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.is_hotfix != 'true' &&
+      needs.orchestrate.outputs.activate_tech_lead == 'true' &&
+      (needs.planning_product.result == 'success' || needs.planning_product.result == 'skipped') &&
+      (needs.planning_ux.result == 'success' || needs.planning_ux.result == 'skipped')
+    with:
+      webhook_username: "Taylor - Lead"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=TaylorLead"
+      prompt: |
+        mapping out the architecture for #${{ needs.orchestrate.outputs.issue_number }}
+
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+        product notes: ${{ needs.planning_product.outputs.result || 'n/a' }}
+        ux notes: ${{ needs.planning_ux.outputs.result || 'n/a' }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  planning_tech_lead:
+    name: Tech Lead
+    needs: [orchestrate, pre_documentation, pre_infrastructure, pre_security]
+    # Skip in hotfix mode - fast-track to implementation
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.is_hotfix != 'true' &&
       needs.orchestrate.outputs.activate_tech_lead == 'true'
     uses: ./.github/workflows/agent-step.yml
     with:
@@ -513,19 +793,62 @@ jobs:
       issue_number: ${{ needs.orchestrate.outputs.issue_number }}
       issue_context: ${{ needs.orchestrate.outputs.issue_context }}
       agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
     secrets: inherit
 
   # ============================================================================
   # STAGE 4: DEVELOPMENT
-  # Main development work by Software and Infrastructure Engineers
   # ============================================================================
-  development-software:
-    name: Software Engineer
-    needs: [orchestrate, planning-product, planning-ux, planning-tech-lead]
+  pre_software_engineer_notify:
+    name: Notify - Software Engineer (Pre)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    needs:
+      [
+        orchestrate,
+        pre_documentation,
+        pre_infrastructure,
+        pre_security,
+        planning_product,
+        planning_ux,
+        planning_tech_lead,
+      ]
     if: |
       always() &&
       needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_software_engineer == 'true'
+      needs.orchestrate.outputs.activate_software_engineer == 'true' &&
+      (needs.planning_product.result == 'success' || needs.planning_product.result == 'skipped') &&
+      (needs.planning_ux.result == 'success' || needs.planning_ux.result == 'skipped') &&
+      (needs.planning_tech_lead.result == 'success' || needs.planning_tech_lead.result == 'skipped')
+    with:
+      webhook_username: "Alex - Dev"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=AlexDev"
+      prompt: |
+        starting implementation on #${{ needs.orchestrate.outputs.issue_number }}
+
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+        product notes: ${{ needs.planning_product.outputs.result || 'n/a' }}
+        ux notes: ${{ needs.planning_ux.outputs.result || 'n/a' }}
+        tech lead notes: ${{ needs.planning_tech_lead.outputs.result || 'n/a' }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  development_software:
+    name: Software Engineer
+    needs: [orchestrate, planning_product, planning_ux, planning_tech_lead]
+    # In hotfix mode, skip waiting for planning agents (they're skipped)
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_software_engineer == 'true' &&
+      (
+        needs.orchestrate.outputs.is_hotfix == 'true' ||
+        (
+          (needs.planning_product.result == 'success' || needs.planning_product.result == 'skipped') &&
+          (needs.planning_ux.result == 'success' || needs.planning_ux.result == 'skipped') &&
+          (needs.planning_tech_lead.result == 'success' || needs.planning_tech_lead.result == 'skipped')
+        )
+      )
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: software-engineer
@@ -533,15 +856,38 @@ jobs:
       issue_number: ${{ needs.orchestrate.outputs.issue_number }}
       issue_context: ${{ needs.orchestrate.outputs.issue_context }}
       agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
       planning_context: |
-        Product Owner: ${{ needs.planning-product.outputs.result || 'Not activated' }}
-        UX Designer: ${{ needs.planning-ux.outputs.result || 'Not activated' }}
-        Tech Lead: ${{ needs.planning-tech-lead.outputs.result || 'Not activated' }}
+        Product Owner: ${{ needs.planning_product.outputs.result || 'Not activated' }}
+        UX Designer: ${{ needs.planning_ux.outputs.result || 'Not activated' }}
+        Tech Lead: ${{ needs.planning_tech_lead.outputs.result || 'Not activated' }}
     secrets: inherit
 
-  development-infrastructure:
+  pre_test-engineer_notify:
+    name: Notify - Test Engineer (Pre)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    needs: [orchestrate, development_software, development_infrastructure]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_test_engineer == 'true' &&
+      (needs.development_software.result == 'success' || needs.development_infrastructure.result == 'success')
+    with:
+      webhook_username: "Jamie - QA"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=JamieQA"
+      prompt: |
+        dev finished up on #${{ needs.orchestrate.outputs.issue_number }}, running tests now
+
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+        dev notes: ${{ needs.development_software.outputs.result || 'n/a' }}
+        infra notes: ${{ needs.development_infrastructure.outputs.result || 'n/a' }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  development_infrastructure:
     name: Infrastructure Engineer (Main)
-    needs: [orchestrate, planning-tech-lead]
+    needs: [orchestrate, planning_tech_lead]
     if: |
       always() &&
       needs.orchestrate.result == 'success' &&
@@ -553,22 +899,44 @@ jobs:
       issue_number: ${{ needs.orchestrate.outputs.issue_number }}
       issue_context: ${{ needs.orchestrate.outputs.issue_context }}
       agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
       planning_context: |
-        Tech Lead: ${{ needs.planning-tech-lead.outputs.result || 'Not activated' }}
+        Tech Lead: ${{ needs.planning_tech_lead.outputs.result || 'Not activated' }}
     secrets: inherit
 
   # ============================================================================
-  # STAGE 5: POST-WORK AGENTS
-  # Testing, documentation updates, and security review
+  # STAGE 5: post_WORK AGENTS
   # ============================================================================
-  post-test:
+  post_infrastructure_notify:
+    name: Notify - Infrastructure Engineer (Post)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    needs: [orchestrate, development_software, development_infrastructure]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_infrastructure_engineer == 'true' &&
+      (needs.development_infrastructure.result == 'success')
+    with:
+      webhook_username: "Sam - Infra"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=SamInfra"
+      prompt: |
+        validating infra changes for #${{ needs.orchestrate.outputs.issue_number }}
+
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+        dev notes: ${{ needs.development_software.outputs.result || 'n/a' }}
+        infra notes: ${{ needs.development_infrastructure.outputs.result || 'n/a' }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  post_test:
     name: Test Engineer
-    needs: [orchestrate, development-software, development-infrastructure]
+    needs: [orchestrate, development_software, development_infrastructure]
     if: |
       always() &&
       needs.orchestrate.result == 'success' &&
       needs.orchestrate.outputs.activate_test_engineer == 'true' &&
-      (needs.development-software.result == 'success' || needs.development-infrastructure.result == 'success')
+      (needs.development_software.result == 'success' || needs.development_infrastructure.result == 'success')
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: test-engineer
@@ -576,16 +944,42 @@ jobs:
       issue_number: ${{ needs.orchestrate.outputs.issue_number }}
       issue_context: ${{ needs.orchestrate.outputs.issue_context }}
       agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
     secrets: inherit
 
-  post-security:
-    name: Security Engineer (Post)
-    needs: [orchestrate, development-software, development-infrastructure]
+  post_security_notify:
+    name: Notify - Security Engineer (Post)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    needs:
+      [orchestrate, development_software, development_infrastructure, post_test]
     if: |
       always() &&
       needs.orchestrate.result == 'success' &&
       needs.orchestrate.outputs.activate_security_engineer == 'true' &&
-      (needs.development-software.result == 'success' || needs.development-infrastructure.result == 'success')
+      (needs.development_software.result == 'success' || needs.development_infrastructure.result == 'success') &&
+      (needs.post_test.result == 'success' || needs.post_test.result == 'skipped')
+    with:
+      webhook_username: "Casey - Security"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=CaseySec"
+      prompt: |
+        running security validation on #${{ needs.orchestrate.outputs.issue_number }}
+
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+        dev notes: ${{ needs.development_software.outputs.result || 'n/a' }}
+        infra notes: ${{ needs.development_infrastructure.outputs.result || 'n/a' }}
+        test notes: ${{ needs.post_test.outputs.result || 'n/a' }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  post_security:
+    name: Security Engineer (Post)
+    needs: [orchestrate, development_software, development_infrastructure]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_security_engineer == 'true' &&
+      (needs.development_software.result == 'success' || needs.development_infrastructure.result == 'success')
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: security-engineer
@@ -593,16 +987,51 @@ jobs:
       issue_number: ${{ needs.orchestrate.outputs.issue_number }}
       issue_context: ${{ needs.orchestrate.outputs.issue_context }}
       agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
     secrets: inherit
 
-  post-documentation:
-    name: Documentation Sheriff (Post)
-    needs: [orchestrate, development-software, development-infrastructure, post-test]
+  post_documentation_notify:
+    name: Notify - Documentation Sheriff (Post)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    needs:
+      [
+        orchestrate,
+        development_software,
+        development_infrastructure,
+        post_test,
+        post_security,
+      ]
     if: |
       always() &&
       needs.orchestrate.result == 'success' &&
       needs.orchestrate.outputs.activate_documentation_sheriff == 'true' &&
-      (needs.development-software.result == 'success' || needs.development-infrastructure.result == 'success')
+      (needs.development_software.result == 'success' || needs.development_infrastructure.result == 'success') &&
+      (needs.post_test.result == 'success' || needs.post_test.result == 'skipped') &&
+      (needs.post_security.result == 'success' || needs.post_security.result == 'skipped')
+    with:
+      webhook_username: "Riley - Docs"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=RileyDocs"
+      prompt: |
+        updating docs for #${{ needs.orchestrate.outputs.issue_number }}
+
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+        dev notes: ${{ needs.development_software.outputs.result || 'n/a' }}
+        infra notes: ${{ needs.development_infrastructure.outputs.result || 'n/a' }}
+        test notes: ${{ needs.post_test.outputs.result || 'n/a' }}
+        security notes: ${{ needs.post_security.outputs.result || 'n/a' }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  post_documentation:
+    name: Documentation Sheriff (Post)
+    needs:
+      [orchestrate, development_software, development_infrastructure, post_test]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_documentation_sheriff == 'true' &&
+      (needs.development_software.result == 'success' || needs.development_infrastructure.result == 'success')
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: documentation-sheriff
@@ -610,15 +1039,40 @@ jobs:
       issue_number: ${{ needs.orchestrate.outputs.issue_number }}
       issue_context: ${{ needs.orchestrate.outputs.issue_context }}
       agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
     secrets: inherit
 
   # ============================================================================
   # STAGE 6: PROJECT MANAGEMENT
-  # Update team tracking and create PR
   # ============================================================================
+  post_project-manager-notify:
+    name: Notify - Project Manager (Pre)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    needs: [orchestrate, post_test, post_security, post_documentation]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.orchestrate.outputs.activate_project_manager == 'true' &&
+      (needs.post_test.result == 'success' || needs.post_test.result == 'skipped') &&
+      (needs.post_security.result == 'success' || needs.post_security.result == 'skipped') &&
+      (needs.post_documentation.result == 'success' || needs.post_documentation.result == 'skipped')
+    with:
+      webhook_username: "Jordan - PM"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=JordanPM"
+      prompt: |
+        wrapping up project tracking for #${{ needs.orchestrate.outputs.issue_number }}
+
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+        test notes: ${{ needs.post_test.outputs.result || 'n/a' }}
+        security notes: ${{ needs.post_security.outputs.result || 'n/a' }}
+        docs notes: ${{ needs.post_documentation.outputs.result || 'n/a' }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
   project-management:
     name: Project Manager
-    needs: [orchestrate, post-test, post-security, post-documentation]
+    needs: [orchestrate, post_test, post_security, post_documentation]
     if: |
       always() &&
       needs.orchestrate.result == 'success' &&
@@ -630,77 +1084,411 @@ jobs:
       issue_number: ${{ needs.orchestrate.outputs.issue_number }}
       issue_context: ${{ needs.orchestrate.outputs.issue_context }}
       agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
     secrets: inherit
 
   # ============================================================================
   # STAGE 7: CREATE PR
-  # Create pull request with all changes
   # ============================================================================
+  create-pr-notify:
+    name: Notify - Create PR (Pre)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    needs: [orchestrate, create-pr]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.create-pr.result == 'success' &&
+      needs.create-pr.outputs.has_changes == 'true'
+    with:
+      webhook_username: "Jordan - PM"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=JordanPM"
+      prompt: |
+        <@${{ vars.DISCORD_TEAM_LEAD_USER_ID }}> PR ready for review!
+
+        pr is up for #${{ needs.orchestrate.outputs.issue_number }}
+        url: ${{ needs.create-pr.outputs.pr_url }}
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+        branch: ${{ needs.orchestrate.outputs.work_branch }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_PR_WEBHOOK_URL }}
+
   create-pr:
     name: Create Pull Request
-    needs: [orchestrate, project-management, post-documentation]
+    needs:
+      [
+        orchestrate,
+        planning_product,
+        planning_ux,
+        planning_tech_lead,
+        development_software,
+        development_infrastructure,
+        post_test,
+        post_security,
+        post_documentation,
+        project-management,
+      ]
     if: |
       always() &&
       needs.orchestrate.result == 'success'
     runs-on: ubuntu-latest
     outputs:
-      pr_number: ${{ steps.create-pr.outputs.pr_number }}
-      pr_url: ${{ steps.create-pr.outputs.pr_url }}
+      pr_number: ${{ steps['create-pr'].outputs.pr_number }}
+      pr_url: ${{ steps['create-pr'].outputs.pr_url }}
+      has_changes: ${{ steps.changes.outputs.has_changes }}
     steps:
-      - name: Checkout repository
+      - name: Checkout work branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          ref: ${{ needs.orchestrate.outputs.work_branch }}
 
       - name: Get issue number
         id: issue
         run: |
           echo "number=${{ needs.orchestrate.outputs.issue_number }}" >> $GITHUB_OUTPUT
 
-      - name: Check for changes
+      - name: Check for changes vs main
         id: changes
+        shell: bash
         run: |
+          set -euo pipefail
           git fetch origin main
+
           if git diff --quiet origin/main..HEAD; then
-            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No changes detected vs origin/main"
           else
-            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "Changes detected vs origin/main"
+            git --no-pager status
+            git --no-pager diff --stat origin/main..HEAD
           fi
+
+      # Generate a comprehensive PR title and description using GPT-4o
+      - name: Get issue details for PR generation
+        id: issue_details
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = ${{ steps.issue.outputs.number }};
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber
+            });
+            core.setOutput('title', issue.title);
+            core.setOutput('body', issue.body || '');
+            core.setOutput('labels', issue.labels.map(l => l.name).join(', '));
+
+      - name: Collect git diff stats
+        id: diff_stats
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Get diff stats summary
+          DIFF_STAT=$(git --no-pager diff --stat origin/main..HEAD)
+          DIFF_SHORTSTAT=$(git --no-pager diff --shortstat origin/main..HEAD)
+
+          # Get list of changed files
+          FILES_CHANGED=$(git --no-pager diff --name-only origin/main..HEAD | head -50)
+
+          # Store outputs using heredoc for multi-line content
+          DELIM="EOF_$(openssl rand -hex 8)"
+          echo "diff_stat<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$DIFF_STAT" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+          echo "shortstat=$DIFF_SHORTSTAT" >> "$GITHUB_OUTPUT"
+
+          echo "files_changed<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$FILES_CHANGED" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+      - name: Generate PR title and description with GPT-4o
+        id: generate_pr
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUE_TITLE: ${{ steps.issue_details.outputs.title }}
+          ISSUE_BODY: ${{ steps.issue_details.outputs.body }}
+          ISSUE_LABELS: ${{ steps.issue_details.outputs.labels }}
+          ISSUE_CONTEXT: ${{ needs.orchestrate.outputs.issue_context }}
+          PRODUCT_RESULT: ${{ needs.planning_product.outputs.result }}
+          UX_RESULT: ${{ needs.planning_ux.outputs.result }}
+          TECH_LEAD_RESULT: ${{ needs.planning_tech_lead.outputs.result }}
+          SOFTWARE_RESULT: ${{ needs.development_software.outputs.result }}
+          INFRA_RESULT: ${{ needs.development_infrastructure.outputs.result }}
+          TEST_RESULT: ${{ needs.post_test.outputs.result }}
+          SECURITY_RESULT: ${{ needs.post_security.outputs.result }}
+          DOCS_RESULT: ${{ needs.post_documentation.outputs.result }}
+          DIFF_SHORTSTAT: ${{ steps.diff_stats.outputs.shortstat }}
+          FILES_CHANGED: ${{ steps.diff_stats.outputs.files_changed }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "OPENAI_API_KEY is missing. Falling back to default PR content."
+            echo "pr_title=[Auto] Resolves #${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "pr_body=Automated PR for issue #${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Build the system prompt
+          SYSTEM_PROMPT=$(cat <<'EOF'
+          You are a PR description generator. Your job is to create clear, informative PR titles and descriptions based on issue context and agent work summaries.
+
+          Guidelines:
+          - Title: Concise, action-oriented (max 72 chars). Format: "<type>: <description>" where type is feat/fix/chore/docs/refactor/test/ci
+          - Description: Well-structured markdown with sections for Summary, Key Changes, and Testing (if applicable)
+          - Focus on WHAT changed and WHY, not the process
+          - Extract key information from agent summaries - they contain the actual work done
+          - Include "Closes #<issue_number>" at the end
+          EOF
+          )
+
+          # Build user prompt with all available context
+          USER_PROMPT=$(cat <<EOF
+          ## Issue
+          #${ISSUE_NUMBER}: ${ISSUE_TITLE}
+          Labels: ${ISSUE_LABELS:-None}
+
+          ### Issue Description
+          ${ISSUE_BODY:-No description provided}
+
+          ## Orchestrator Context
+          ${ISSUE_CONTEXT:-No context provided}
+
+          ## Agent Work Summaries
+          (Each agent output contains: summary, files_changed, commits_made, notes_for_next_agent)
+
+          ### Product Owner
+          ${PRODUCT_RESULT:-Not activated}
+
+          ### UX Designer
+          ${UX_RESULT:-Not activated}
+
+          ### Tech Lead
+          ${TECH_LEAD_RESULT:-Not activated}
+
+          ### Software Engineer
+          ${SOFTWARE_RESULT:-Not activated}
+
+          ### Infrastructure Engineer
+          ${INFRA_RESULT:-Not activated}
+
+          ### Test Engineer
+          ${TEST_RESULT:-Not activated}
+
+          ### Security Engineer
+          ${SECURITY_RESULT:-Not activated}
+
+          ### Documentation Sheriff
+          ${DOCS_RESULT:-Not activated}
+
+          ## Git Changes
+          ${DIFF_SHORTSTAT:-No changes}
+
+          ### Files Changed
+          ${FILES_CHANGED:-No files}
+
+          ---
+          Generate a PR title and comprehensive description based on the above context.
+          EOF
+          )
+
+          # Define structured output schema
+          SCHEMA_JSON=$(cat <<'EOF'
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["title", "body"],
+            "properties": {
+              "title": { 
+                "type": "string",
+                "description": "Concise PR title (max 72 chars), format: <type>: <description>"
+              },
+              "body": { 
+                "type": "string",
+                "description": "Comprehensive PR description in markdown format"
+              }
+            }
+          }
+          EOF
+          )
+
+          # Build OpenAI API request
+          jq -n \
+            --arg model "gpt-4o-2024-08-06" \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg user "$USER_PROMPT" \
+            --argjson schema "$SCHEMA_JSON" \
+            '{
+              model: $model,
+              store: false,
+              temperature: 0.3,
+              max_output_tokens: 2000,
+              input: [
+                { role: "system", content: $system },
+                { role: "user", content: $user }
+              ],
+              text: {
+                format: {
+                  type: "json_schema",
+                  name: "pr_content",
+                  strict: true,
+                  schema: $schema
+                }
+              }
+            }' > /tmp/openai_pr_request.json
+
+          # Call OpenAI API
+          curl -sS https://api.openai.com/v1/responses \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -d @/tmp/openai_pr_request.json \
+            > /tmp/openai_pr_response.json
+
+          # Check for API errors
+          if jq -e '.error' /tmp/openai_pr_response.json >/dev/null; then
+            echo "OpenAI API error, falling back to default PR content:"
+            jq -r '.error' /tmp/openai_pr_response.json
+            echo "pr_title=[Auto] Resolves #${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "pr_body=Automated PR for issue #${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Extract the generated content
+          PR_JSON="$(jq -r '
+            .output[]
+            | select(.type=="message")
+            | .content[]
+            | select(.type=="output_text")
+            | .text
+          ' /tmp/openai_pr_response.json)"
+
+          if [ -z "${PR_JSON:-}" ] || [ "${PR_JSON}" = "null" ]; then
+            echo "No output_text found in response, falling back to default:"
+            jq . /tmp/openai_pr_response.json
+            echo "pr_title=[Auto] Resolves #${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "pr_body=Automated PR for issue #${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Parse and output the title and body
+          PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
+          PR_BODY=$(echo "$PR_JSON" | jq -r '.body')
+
+          echo "Generated PR Title: $PR_TITLE"
+          echo "pr_title=$PR_TITLE" >> "$GITHUB_OUTPUT"
+
+          # Use heredoc for multi-line body
+          DELIM="EOF_$(openssl rand -hex 8)"
+          echo "pr_body<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$PR_BODY" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
 
       - name: Create Pull Request
         id: create-pr
         if: steps.changes.outputs.has_changes == 'true'
         uses: actions/github-script@v7
+        env:
+          GENERATED_TITLE: ${{ steps.generate_pr.outputs.pr_title }}
+          GENERATED_BODY: ${{ steps.generate_pr.outputs.pr_body }}
         with:
           github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
           script: |
             const issueNumber = ${{ steps.issue.outputs.number }};
-            const branchName = `issue-${issueNumber}-auto`;
+            const branchName = `${{ needs.orchestrate.outputs.work_branch }}`;
+
+            // Check if a PR already exists for this branch
+            const { data: existingPRs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${branchName}`,
+              base: 'main',
+              state: 'open'
+            });
+
+            if (existingPRs.length > 0) {
+              // PR already exists, reuse it
+              const existingPR = existingPRs[0];
+              console.log(`PR #${existingPR.number} already exists for branch ${branchName}`);
+              core.setOutput('pr_number', existingPR.number);
+              core.setOutput('pr_url', existingPR.html_url);
+              return;
+            }
+
+            // Use GPT-4o generated title and body, with fallbacks
+            const generatedTitle = process.env.GENERATED_TITLE || `[Auto] Resolves #${issueNumber}`;
+            const generatedBody = process.env.GENERATED_BODY || 'Automated PR for issue.';
+
+            // Embed agent_prompts JSON for fix-review-feedback workflow to retrieve
+            const agentPromptsJson = JSON.stringify(${{ needs.orchestrate.outputs.agent_prompts }});
+
+            // Combine generated body with required metadata
+            const prBody = [
+              generatedBody,
+              '',
+              '---',
+              '',
+              `Closes #${issueNumber}`,
+              '',
+              '<!-- AGENT_PROMPTS_JSON',
+              agentPromptsJson,
+              '-->'
+            ].join('\n');
 
             const { data: pr } = await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `[Auto] Resolves #${issueNumber}`,
-              body: `## Automated PR for Issue #${issueNumber}\n\nThis PR was automatically generated by the AI agent pipeline.\n\n### Issue Context\n${{ needs.orchestrate.outputs.issue_context }}\n\nCloses #${issueNumber}`,
+              title: generatedTitle,
+              body: prBody,
               head: branchName,
               base: 'main'
             });
 
+            console.log(`Created PR #${pr.number}: ${generatedTitle}`);
             core.setOutput('pr_number', pr.number);
             core.setOutput('pr_url', pr.html_url);
 
   # ============================================================================
   # STAGE 8: CODE REVIEW
-  # Final code review of the PR
   # ============================================================================
+  code-review-notify:
+    name: Notify - Code Reviewer (Pre)
+    uses: ./.github/workflows/discord-gpt-message.yml
+    needs: [orchestrate, create-pr]
+    if: |
+      always() &&
+      needs.orchestrate.result == 'success' &&
+      needs.create-pr.result == 'success' &&
+      needs.create-pr.outputs.pr_number != ''
+    with:
+      webhook_username: "Avery - Review"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=AveryReview"
+      prompt: |
+        reviewing pr for #${{ needs.orchestrate.outputs.issue_number }}
+
+        context: ${{ needs.orchestrate.outputs.issue_context }}
+        pr: ${{ needs.create-pr.outputs.pr_url }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
   code-review:
     name: Code Reviewer
     needs: [orchestrate, create-pr]
     if: |
       always() &&
-      needs.create-pr.result == 'success' &&
-      needs.create-pr.outputs.pr_number != ''
+      needs['create-pr'].result == 'success' &&
+      needs['create-pr'].outputs.pr_number != ''
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: code-reviewer
@@ -708,12 +1496,12 @@ jobs:
       issue_number: ${{ needs.orchestrate.outputs.issue_number }}
       issue_context: ${{ needs.orchestrate.outputs.issue_context }}
       agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
-      pr_number: ${{ needs.create-pr.outputs.pr_number }}
+      pr_number: ${{ needs['create-pr'].outputs.pr_number }}
+      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
     secrets: inherit
 
   # ============================================================================
   # STAGE 9: WRAP-UP
-  # Orchestrator appends session summary to DEVLOG.md
   # ============================================================================
   wrap-up:
     name: Wrap Up Session
@@ -721,32 +1509,37 @@ jobs:
     if: always() && needs.orchestrate.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout work branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          ref: ${{ needs.orchestrate.outputs.work_branch }}
 
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull origin main
+          git fetch origin "${{ needs.orchestrate.outputs.work_branch }}"
+          git checkout -B "${{ needs.orchestrate.outputs.work_branch }}" "origin/${{ needs.orchestrate.outputs.work_branch }}"
 
       - name: Append to DEVLOG.md
-        uses: anthropics/claude-code-action@beta
+        uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --model claude-opus-4-5-20251101
+            --max-turns 6000
           prompt: |
             You are the Pipeline Orchestrator wrapping up a session.
 
             ## Session Summary
             - Issue: #${{ needs.orchestrate.outputs.issue_number }}
             - Context: ${{ needs.orchestrate.outputs.issue_context }}
-            - PR Created: ${{ needs.create-pr.outputs.pr_url || 'None' }}
-            - Code Review Result: ${{ needs.code-review.result || 'Skipped' }}
-            - Code Review Status: ${{ needs.code-review.outputs.review_status || 'Not Available' }}
+            ${{ needs['create-pr'].outputs.pr_url && format('- PR Created: {0}', needs['create-pr'].outputs.pr_url) || '' }}
+            ${{ needs['code-review'].result && format('- Code Review Result: {0}', needs['code-review'].result) || '' }}
+            ${{ needs['code-review'].outputs.result || '' }}
 
             ## Your Task
             1. Read the issue context file at working/issues/ for issue #${{ needs.orchestrate.outputs.issue_number }}

@@ -1,0 +1,513 @@
+# Auto-Merge Pipeline
+# Automatically merges approved PRs when CI passes, or triggers fix agents on CI failure
+# See: docs/automation/auto-merge.md
+
+name: Auto-Merge Approved PRs
+
+on:
+  pull_request_review:
+    types: [submitted]
+  check_suite:
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to merge"
+        required: true
+        type: number
+
+concurrency:
+  group: auto-merge-${{ github.event.pull_request.number || github.event.check_suite.pull_requests[0].number || inputs.pr_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  # ============================================================================
+  # Check if PR is ready to merge
+  # ============================================================================
+  check-mergeable:
+    name: Check Merge Eligibility
+    runs-on: ubuntu-latest
+    outputs:
+      should_merge: ${{ steps.decision.outputs.should_merge }}
+      ci_failed: ${{ steps.decision.outputs.ci_failed }}
+      pr_number: ${{ steps.pr.outputs.number }}
+      pr_title: ${{ steps.pr.outputs.title }}
+      branch: ${{ steps.pr.outputs.branch }}
+      failure_details: ${{ steps.ci.outputs.failure_details }}
+    steps:
+      - name: Determine PR number
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            let prNumber;
+
+            if (context.eventName === 'workflow_dispatch') {
+              prNumber = parseInt('${{ inputs.pr_number }}');
+            } else if (context.eventName === 'pull_request_review') {
+              prNumber = context.payload.pull_request.number;
+            } else if (context.eventName === 'check_suite') {
+              // Find PR associated with this check suite
+              const { data: prs } = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                head: `${context.repo.owner}:${context.payload.check_suite.head_branch}`,
+                state: 'open'
+              });
+              prNumber = prs[0]?.number;
+            }
+
+            if (!prNumber) {
+              core.setOutput('found', 'false');
+              console.log('No PR found for this event');
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            core.setOutput('found', 'true');
+            core.setOutput('number', prNumber);
+            core.setOutput('title', pr.title);
+            core.setOutput('branch', pr.head.ref);
+            console.log(`Found PR #${prNumber}: ${pr.title}`);
+
+      - name: Check approval status
+        id: approval
+        if: steps.pr.outputs.found == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt('${{ steps.pr.outputs.number }}');
+
+            const { data: reviews } = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            // Get latest review per user
+            const latestReviews = {};
+            for (const review of reviews) {
+              latestReviews[review.user.login] = review;
+            }
+
+            const hasApproval = Object.values(latestReviews).some(r => r.state === 'APPROVED');
+            const hasRejection = Object.values(latestReviews).some(r => r.state === 'CHANGES_REQUESTED');
+
+            console.log(`Approval status: hasApproval=${hasApproval}, hasRejection=${hasRejection}`);
+            core.setOutput('approved', hasApproval && !hasRejection ? 'true' : 'false');
+
+      - name: Check CI status
+        id: ci
+        if: steps.pr.outputs.found == 'true' && steps.approval.outputs.approved == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt('${{ steps.pr.outputs.number }}');
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            // Get combined status
+            const { data: status } = await github.rest.repos.getCombinedStatusForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: pr.head.sha
+            });
+
+            // Get check runs
+            const { data: checks } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: pr.head.sha
+            });
+
+            const failedChecks = checks.check_runs.filter(c => 
+              c.conclusion === 'failure' || c.conclusion === 'cancelled'
+            );
+
+            const pendingChecks = checks.check_runs.filter(c => 
+              c.status === 'in_progress' || c.status === 'queued'
+            );
+
+            if (pendingChecks.length > 0) {
+              console.log(`CI pending: ${pendingChecks.length} checks still running`);
+              core.setOutput('status', 'pending');
+              core.setOutput('failure_details', '');
+            } else if (failedChecks.length > 0) {
+              console.log(`CI failed: ${failedChecks.length} checks failed`);
+              const details = failedChecks.map(c => `- ${c.name}: ${c.conclusion}`).join('\n');
+              core.setOutput('status', 'failure');
+              core.setOutput('failure_details', details);
+            } else if (status.state === 'success' || checks.check_runs.every(c => c.conclusion === 'success' || c.conclusion === 'skipped')) {
+              console.log('CI passed');
+              core.setOutput('status', 'success');
+              core.setOutput('failure_details', '');
+            } else {
+              console.log('CI status unknown');
+              core.setOutput('status', 'unknown');
+              core.setOutput('failure_details', '');
+            }
+
+      - name: Check for blocking labels and fix status
+        id: labels
+        if: steps.pr.outputs.found == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt('${{ steps.pr.outputs.number }}');
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            const blockingLabels = ['do-not-merge', 'needs-human-review', 'wip', 'blocked'];
+            const hasBlocking = pr.labels.some(l => blockingLabels.includes(l.name.toLowerCase()));
+
+            // Check if fix iteration limit has been reached (fix-iteration-3)
+            const hasMaxIterations = pr.labels.some(l => l.name === 'fix-iteration-3');
+
+            // Check if a fix is currently in progress
+            const fixInProgress = pr.labels.some(l => l.name === 'fix-in-progress');
+
+            console.log(`Blocking labels: ${hasBlocking}`);
+            console.log(`Max fix iterations reached: ${hasMaxIterations}`);
+            console.log(`Fix in progress: ${fixInProgress}`);
+
+            // Block if any blocking labels, max iterations reached, or fix in progress
+            const isBlocked = hasBlocking || hasMaxIterations || fixInProgress;
+            core.setOutput('blocked', isBlocked ? 'true' : 'false');
+            core.setOutput('fix_in_progress', fixInProgress ? 'true' : 'false');
+            core.setOutput('max_iterations', hasMaxIterations ? 'true' : 'false');
+
+      - name: Make merge decision
+        id: decision
+        if: steps.pr.outputs.found == 'true'
+        run: |
+          APPROVED="${{ steps.approval.outputs.approved }}"
+          CI_STATUS="${{ steps.ci.outputs.status }}"
+          BLOCKED="${{ steps.labels.outputs.blocked }}"
+          FIX_IN_PROGRESS="${{ steps.labels.outputs.fix_in_progress }}"
+          MAX_ITERATIONS="${{ steps.labels.outputs.max_iterations }}"
+
+          echo "Decision inputs: approved=$APPROVED, ci_status=$CI_STATUS, blocked=$BLOCKED, fix_in_progress=$FIX_IN_PROGRESS, max_iterations=$MAX_ITERATIONS"
+
+          if [ "$APPROVED" == "true" ] && [ "$CI_STATUS" == "success" ] && [ "$BLOCKED" == "false" ]; then
+            echo "should_merge=true" >> "$GITHUB_OUTPUT"
+            echo "ci_failed=false" >> "$GITHUB_OUTPUT"
+            echo "Decision: MERGE"
+          elif [ "$APPROVED" == "true" ] && [ "$CI_STATUS" == "failure" ] && [ "$FIX_IN_PROGRESS" == "false" ] && [ "$MAX_ITERATIONS" == "false" ]; then
+            # Only trigger fix agents if no fix is currently in progress and we haven't hit max iterations
+            echo "should_merge=false" >> "$GITHUB_OUTPUT"
+            echo "ci_failed=true" >> "$GITHUB_OUTPUT"
+            echo "Decision: CI FAILED - trigger fix agents"
+          elif [ "$FIX_IN_PROGRESS" == "true" ]; then
+            echo "should_merge=false" >> "$GITHUB_OUTPUT"
+            echo "ci_failed=false" >> "$GITHUB_OUTPUT"
+            echo "Decision: SKIP - fix already in progress"
+          elif [ "$MAX_ITERATIONS" == "true" ]; then
+            echo "should_merge=false" >> "$GITHUB_OUTPUT"
+            echo "ci_failed=false" >> "$GITHUB_OUTPUT"
+            echo "Decision: SKIP - max fix iterations reached, needs human review"
+          else
+            echo "should_merge=false" >> "$GITHUB_OUTPUT"
+            echo "ci_failed=false" >> "$GITHUB_OUTPUT"
+            echo "Decision: NOT READY"
+          fi
+
+  # ============================================================================
+  # Handle CI failures by triggering fix-review-feedback
+  # ============================================================================
+  handle-ci-failure:
+    name: Handle CI Failure
+    needs: check-mergeable
+    if: needs.check-mergeable.outputs.ci_failed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout for test analysis
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-mergeable.outputs.branch }}
+          fetch-depth: 10
+
+      - name: Fetch CI logs for context
+        id: logs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Get the failed check run details including output/logs
+            const prNumber = parseInt('${{ needs.check-mergeable.outputs.pr_number }}');
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            const { data: checks } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: pr.head.sha
+            });
+
+            const failedChecks = checks.check_runs.filter(c => 
+              c.conclusion === 'failure'
+            );
+
+            // Extract output summaries from failed checks
+            const summaries = failedChecks.map(c => ({
+              name: c.name,
+              summary: c.output?.summary || '',
+              text: (c.output?.text || '').slice(0, 2000) // Limit log size
+            }));
+
+            core.setOutput('logs', JSON.stringify(summaries));
+            console.log(`Collected logs from ${failedChecks.length} failed checks`);
+
+      - name: Generate failure analysis (GPT-4o)
+        id: analyze
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FAILURE_DETAILS: ${{ needs.check-mergeable.outputs.failure_details }}
+          CI_LOGS: ${{ steps.logs.outputs.logs }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SYSTEM_PROMPT=$(cat <<'SYSPROMPT'
+          You are a CI failure analyst reviewing test failures on an approved PR.
+          Your job is to analyze failures and determine:
+          1. Whether the CODE needs to be fixed to pass the tests
+          2. Whether the TESTS themselves may be inappropriate and need fixing
+          Tests may be inappropriate if they have flaky behavior, test implementation details,
+          have incorrect assertions, were written for a different feature, have hardcoded stale values,
+          or are overly strict. If you believe tests may be inappropriate, clearly flag this with a
+          TEST REVIEW NEEDED section so fix agents know to evaluate the tests, not just the code.
+          SYSPROMPT
+          )
+
+          USER_PROMPT=$(cat <<USERPROMPT
+          CI checks failed on this approved PR. Analyze the failures.
+          Failed Checks: ${FAILURE_DETAILS}
+          CI Logs: ${CI_LOGS}
+          Provide a code review comment that lists what failed, analyzes likely root cause,
+          determines if this is a CODE issue or TEST issue, and provides guidance for fix agents.
+          USERPROMPT
+          )
+
+          cat > /tmp/schema.json <<'SCHEMA'
+          {"type":"object","additionalProperties":false,"required":["message","has_test_concerns"],"properties":{"message":{"type":"string"},"has_test_concerns":{"type":"boolean"}}}
+          SCHEMA
+
+          jq -n \
+            --arg model "gpt-4o-2024-08-06" \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg user "$USER_PROMPT" \
+            --slurpfile schema /tmp/schema.json \
+            '{model:$model,store:false,temperature:0.2,max_output_tokens:2000,input:[{role:"system",content:$system},{role:"user",content:$user}],text:{format:{type:"json_schema",name:"ci_analysis",strict:true,schema:$schema[0]}}}' \
+            > /tmp/openai_request.json
+
+          curl -sS https://api.openai.com/v1/responses \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -d @/tmp/openai_request.json \
+            > /tmp/openai_response.json
+
+          if jq -e '.error' /tmp/openai_response.json >/dev/null; then
+            echo "OpenAI API error:"
+            jq -r '.error' /tmp/openai_response.json
+            echo 'message=CI checks are failing. Please review and fix.' >> "$GITHUB_OUTPUT"
+            echo 'has_test_concerns=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ANALYSIS_JSON="$(jq -r '.output[] | select(.type=="message") | .content[] | select(.type=="output_text") | .text' /tmp/openai_response.json)"
+
+          if [ -z "${ANALYSIS_JSON:-}" ] || [ "${ANALYSIS_JSON}" = "null" ]; then
+            echo 'message=CI checks are failing. Please review and fix.' >> "$GITHUB_OUTPUT"
+            echo 'has_test_concerns=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          MESSAGE=$(echo "$ANALYSIS_JSON" | jq -r '.message')
+          HAS_TEST_CONCERNS=$(echo "$ANALYSIS_JSON" | jq -r '.has_test_concerns')
+
+          DELIM="EOF_$(openssl rand -hex 8)"
+          echo "message<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$MESSAGE" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+          echo "has_test_concerns=$HAS_TEST_CONCERNS" >> "$GITHUB_OUTPUT"
+
+      - name: Post review requesting changes
+        uses: actions/github-script@v7
+        env:
+          ANALYSIS: ${{ steps.analyze.outputs.message }}
+          HAS_TEST_CONCERNS: ${{ steps.analyze.outputs.has_test_concerns }}
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const prNumber = parseInt('${{ needs.check-mergeable.outputs.pr_number }}');
+            const hasTestConcerns = process.env.HAS_TEST_CONCERNS === 'true';
+
+            const separator = '---';
+            let body = `## 🔴 CI Failure Detected\n\nThis PR was approved but CI checks are failing. Automated fix agents will attempt to resolve this.\n\n${process.env.ANALYSIS}`;
+
+            if (hasTestConcerns) {
+              body += `\n\n${separator}\n### 🔧 Fix Agent Guidance\n\nThe analysis above suggests the **tests themselves may need review**. Fix agents should:\n1. First evaluate if the failing tests are appropriate for this feature\n2. If tests are inappropriate, fix or update the tests\n3. If tests are valid, fix the code to pass them\n4. Document your reasoning in the commit message`;
+            } else {
+              body += `\n\n${separator}\n### 🔧 Fix Agent Guidance\n\nThe analysis suggests this is a **code issue**. Fix agents should focus on updating the implementation to pass the existing tests.`;
+            }
+
+            body += `\n\n${separator}\n> 🤖 Posted by Auto-Merge workflow to trigger fix-review-feedback pipeline`;
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              event: 'REQUEST_CHANGES',
+              body
+            });
+
+            console.log(`Posted REQUEST_CHANGES review for PR #${prNumber} (test concerns: ${hasTestConcerns})`);
+
+  # ============================================================================
+  # Notify team about CI failure
+  # ============================================================================
+  notify-ci-failure:
+    name: Notify CI Failure
+    needs: [check-mergeable, handle-ci-failure]
+    if: needs.handle-ci-failure.result == 'success'
+    uses: ./.github/workflows/discord-gpt-message.yml
+    with:
+      webhook_username: "Avery - Review"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=AveryReview"
+      prompt: |
+        PR #${{ needs.check-mergeable.outputs.pr_number }} was approved but CI is failing, triggering fix agents
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Merge the PR
+  # ============================================================================
+  merge:
+    name: Merge PR
+    needs: check-mergeable
+    if: needs.check-mergeable.outputs.should_merge == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate squash commit message (GPT-4o)
+        id: commit_msg
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PR_NUMBER: ${{ needs.check-mergeable.outputs.pr_number }}
+          PR_TITLE: ${{ needs.check-mergeable.outputs.pr_title }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SYSTEM_PROMPT="You generate clean, concise git commit messages. Follow conventional commits format."
+          USER_PROMPT="Generate a squash commit message for PR #${PR_NUMBER}: ${PR_TITLE}. Keep title under 72 chars."
+
+          cat > /tmp/schema.json <<'SCHEMA'
+          {"type":"object","additionalProperties":false,"required":["title","body"],"properties":{"title":{"type":"string"},"body":{"type":"string"}}}
+          SCHEMA
+
+          jq -n \
+            --arg model "gpt-4o-2024-08-06" \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg user "$USER_PROMPT" \
+            --slurpfile schema /tmp/schema.json \
+            '{model:$model,store:false,temperature:0.2,max_output_tokens:500,input:[{role:"system",content:$system},{role:"user",content:$user}],text:{format:{type:"json_schema",name:"commit_message",strict:true,schema:$schema[0]}}}' \
+            > /tmp/openai_request.json
+
+          curl -sS https://api.openai.com/v1/responses \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -d @/tmp/openai_request.json \
+            > /tmp/openai_response.json
+
+          COMMIT_JSON="$(jq -r '.output[] | select(.type=="message") | .content[] | select(.type=="output_text") | .text' /tmp/openai_response.json 2>/dev/null || echo '{}')"
+
+          TITLE=$(echo "$COMMIT_JSON" | jq -r '.title // empty')
+          BODY=$(echo "$COMMIT_JSON" | jq -r '.body // empty')
+
+          if [ -z "$TITLE" ]; then
+            TITLE="${PR_TITLE}"
+          fi
+
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+
+          DELIM="EOF_$(openssl rand -hex 8)"
+          echo "body<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$BODY" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+      - name: Squash and merge
+        uses: actions/github-script@v7
+        env:
+          COMMIT_TITLE: ${{ steps.commit_msg.outputs.title }}
+          COMMIT_BODY: ${{ steps.commit_msg.outputs.body }}
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const prNumber = parseInt('${{ needs.check-mergeable.outputs.pr_number }}');
+
+            await github.rest.pulls.merge({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              merge_method: 'squash',
+              commit_title: process.env.COMMIT_TITLE,
+              commit_message: process.env.COMMIT_BODY
+            });
+
+            console.log(`Merged PR #${prNumber}`);
+
+      - name: Delete branch
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            try {
+              await github.rest.git.deleteRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `heads/${{ needs.check-mergeable.outputs.branch }}`
+              });
+              console.log('Deleted branch ${{ needs.check-mergeable.outputs.branch }}');
+            } catch (e) {
+              console.log('Branch already deleted or protected');
+            }
+
+  # ============================================================================
+  # Notify on merge
+  # ============================================================================
+  notify-merge:
+    name: Notify Merge
+    needs: [check-mergeable, merge]
+    if: needs.merge.result == 'success'
+    uses: ./.github/workflows/discord-gpt-message.yml
+    with:
+      webhook_username: "Jordan - PM"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=JordanPM"
+      prompt: |
+        <@${{ vars.DISCORD_TEAM_LEAD_USER_ID }}> PR #${{ needs.check-mergeable.outputs.pr_number }} has been merged!
+
+        ${{ needs.check-mergeable.outputs.pr_title }} is now on main
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_PR_WEBHOOK_URL }}

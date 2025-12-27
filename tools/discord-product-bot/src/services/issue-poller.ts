@@ -11,6 +11,8 @@ import {
   type TrackedIssue,
 } from './issue-tracker.js';
 import { notifyPrReady, notifyMerge, notifyClosure } from './pr-notifier.js';
+import { rankOpenIssues, postIssueSuggestion } from './suggestion-service.js';
+import { listIssues } from './github.js';
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 
@@ -71,6 +73,9 @@ async function pollSingleIssue(client: Client, issue: TrackedIssue): Promise<voi
 
     if (update && update.newStatus === 'closed') {
       console.log(`[IssuePoller] Issue #${issue.issueNumber} is now closed`);
+      
+      // Trigger next issue suggestion flow when an issue closes
+      await handleIssueClosed(client, issue.issueNumber, issue.title);
     }
 
     if (!issue.linkedPrNumber) {
@@ -93,6 +98,42 @@ async function pollSingleIssue(client: Client, issue: TrackedIssue): Promise<voi
     }
   } catch (error) {
     console.error(`[IssuePoller] Error polling issue #${issue.issueNumber}:`, error);
+  }
+}
+
+/**
+ * Handles the flow when an issue is closed:
+ * 1. Checks if there are more open issues
+ * 2. If yes, ranks them and posts a suggestion to Discord
+ */
+async function handleIssueClosed(
+  client: Client,
+  closedIssueNumber: number,
+  closedIssueTitle: string
+): Promise<void> {
+  try {
+    // Check if there are more open issues
+    const openIssues = await listIssues('open', undefined, 10);
+    
+    if (openIssues.length === 0) {
+      console.log('[IssuePoller] No more open issues - nothing to suggest');
+      return;
+    }
+
+    console.log(`[IssuePoller] Issue #${closedIssueNumber} closed, ${openIssues.length} open issues remain`);
+
+    // Rank the open issues
+    const rankedIssues = await rankOpenIssues(closedIssueNumber, closedIssueTitle);
+    
+    if (rankedIssues.length === 0) {
+      console.log('[IssuePoller] No issues to suggest after ranking');
+      return;
+    }
+
+    // Post suggestion to Discord
+    await postIssueSuggestion(client, closedIssueNumber, closedIssueTitle, rankedIssues);
+  } catch (error) {
+    console.error('[IssuePoller] Error handling issue closure:', error);
   }
 }
 

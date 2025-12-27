@@ -158,6 +158,7 @@ Entry format: `- [ ] {description} - Found in #{issue}, {agent}, YYYY-MM-DD`
 | `ECR_REPOSITORY` | `soyl-discord-bot` | ECR repository name |
 | `ECS_CLUSTER` | `soyl-cluster` | ECS cluster name |
 | `ECS_SERVICE` | `soyl-discord-bot` | ECS service name |
+| `PRODUCT_BOT_CLIENT_ID` | - | Product Bot's Discord client ID (for Business Bot auto-invite) |
 
 ## Tools
 
@@ -165,6 +166,16 @@ Entry format: `- [ ] {description} - Found in #{issue}, {agent}, YYYY-MM-DD`
 Always-on Discord bot deployed to AWS Fargate. Monitors product and dev channels for user interactions.
 - Auto-deploys on push to `main` when `tools/discord-product-bot/**` changes
 - See `tools/discord-product-bot/README.md` for deployment setup
+
+### Business Bot (`tools/business-bot/`)
+Discord bot for managing business projects with integrated domain, GitHub, and Discord server management.
+- GPT-4o powered conversation with state machine routing
+- Integrations: Namecheap (domains), GitHub (repos), Discord (servers), Tavily (research)
+- Human approval flow for resource creation (domains cost money!)
+- Creates Discord servers with standard channel structure and welcome message
+- Automatically provides Product Bot invite link in new servers
+- Auto-deploys on push to `main` when `tools/business-bot/**` changes
+- See `tools/business-bot/README.md` for deployment setup
 
 ### MCP Discord (`tools/mcp-discord/`)
 MCP server that gives agents the ability to post updates to Discord during pipeline execution.

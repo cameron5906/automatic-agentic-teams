@@ -44,7 +44,7 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$Profile,
 
-    [string]$Region = "us-east-1",
+    [string]$Region = "us-east-2",
     [string]$ClusterName = "soyl-cluster",
     [string]$ServiceName = "soyl-discord-bot",
     [string]$RepoName = "soyl-discord-bot"
@@ -72,23 +72,31 @@ function Get-AccountId {
 
 # Check if resource exists
 function Test-EcrRepo {
-    $result = aws ecr describe-repositories --profile $Profile --region $Region --repository-names $RepoName 2>$null
+    $ErrorActionPreference = "SilentlyContinue"
+    $result = aws ecr describe-repositories --profile $Profile --region $Region --repository-names $RepoName 2>&1
+    $ErrorActionPreference = "Stop"
     return $LASTEXITCODE -eq 0
 }
 
 function Test-EcsCluster {
-    $result = aws ecs describe-clusters --profile $Profile --region $Region --clusters $ClusterName --query "clusters[?status=='ACTIVE'].clusterName" --output text 2>$null
+    $ErrorActionPreference = "SilentlyContinue"
+    $result = aws ecs describe-clusters --profile $Profile --region $Region --clusters $ClusterName --query "clusters[?status=='ACTIVE'].clusterName" --output text 2>&1
+    $ErrorActionPreference = "Stop"
     return ($result -and $result.Trim() -eq $ClusterName)
 }
 
 function Test-EcsService {
-    $result = aws ecs describe-services --profile $Profile --region $Region --cluster $ClusterName --services $ServiceName --query "services[?status=='ACTIVE'].serviceName" --output text 2>$null
+    $ErrorActionPreference = "SilentlyContinue"
+    $result = aws ecs describe-services --profile $Profile --region $Region --cluster $ClusterName --services $ServiceName --query "services[?status=='ACTIVE'].serviceName" --output text 2>&1
+    $ErrorActionPreference = "Stop"
     return ($result -and $result.Trim() -eq $ServiceName)
 }
 
 function Test-Secret {
     param($SecretName)
-    $result = aws secretsmanager describe-secret --profile $Profile --region $Region --secret-id $SecretName 2>$null
+    $ErrorActionPreference = "SilentlyContinue"
+    $result = aws secretsmanager describe-secret --profile $Profile --region $Region --secret-id $SecretName 2>&1
+    $ErrorActionPreference = "Stop"
     return $LASTEXITCODE -eq 0
 }
 
@@ -157,49 +165,39 @@ function Invoke-Setup {
     $taskRoleName = "ecs-task-role"
 
     # Check if execution role exists
-    $roleExists = aws iam get-role --profile $Profile --role-name $executionRoleName 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        # Create trust policy
-        $trustPolicy = @{
-            Version = "2012-10-17"
-            Statement = @(
-                @{
-                    Effect = "Allow"
-                    Principal = @{ Service = "ecs-tasks.amazonaws.com" }
-                    Action = "sts:AssumeRole"
-                }
-            )
-        } | ConvertTo-Json -Depth 10 -Compress
+    $ErrorActionPreference = "SilentlyContinue"
+    $roleExists = aws iam get-role --profile $Profile --role-name $executionRoleName 2>&1
+    $roleCheckExitCode = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($roleCheckExitCode -ne 0) {
+        # Create trust policy - write to temp file for Windows compatibility
+        $trustPolicyFile = Join-Path $env:TEMP "trust-policy.json"
+        $trustPolicyJson = '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+        [System.IO.File]::WriteAllText($trustPolicyFile, $trustPolicyJson)
 
         aws iam create-role --profile $Profile `
             --role-name $executionRoleName `
-            --assume-role-policy-document $trustPolicy | Out-Null
+            --assume-role-policy-document "file://$trustPolicyFile" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Failed to create IAM role" }
 
         # Attach managed policy
         aws iam attach-role-policy --profile $Profile `
             --role-name $executionRoleName `
             --policy-arn "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Failed to attach managed policy" }
 
         # Add Secrets Manager access
-        $secretsPolicy = @{
-            Version = "2012-10-17"
-            Statement = @(
-                @{
-                    Effect = "Allow"
-                    Action = @("secretsmanager:GetSecretValue")
-                    Resource = @(
-                        "arn:aws:secretsmanager:${Region}:${accountId}:secret:discord-bot-token-*",
-                        "arn:aws:secretsmanager:${Region}:${accountId}:secret:github-token-*",
-                        "arn:aws:secretsmanager:${Region}:${accountId}:secret:openai-api-key-*"
-                    )
-                }
-            )
-        } | ConvertTo-Json -Depth 10 -Compress
+        $secretsPolicyFile = Join-Path $env:TEMP "secrets-policy.json"
+        $secretsPolicyJson = @"
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":["arn:aws:secretsmanager:${Region}:${accountId}:secret:discord-bot-token-*","arn:aws:secretsmanager:${Region}:${accountId}:secret:github-token-*","arn:aws:secretsmanager:${Region}:${accountId}:secret:openai-api-key-*"]}]}
+"@
+        [System.IO.File]::WriteAllText($secretsPolicyFile, $secretsPolicyJson)
 
         aws iam put-role-policy --profile $Profile `
             --role-name $executionRoleName `
             --policy-name "SecretsManagerAccess" `
-            --policy-document $secretsPolicy | Out-Null
+            --policy-document "file://$secretsPolicyFile" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Failed to add secrets policy" }
 
         Write-Success "Created IAM role: $executionRoleName"
     } else {
@@ -209,8 +207,11 @@ function Invoke-Setup {
     # 5. Create CloudWatch Log Group
     Write-Step "Creating CloudWatch log group..."
     $logGroup = "/ecs/$ServiceName"
-    aws logs create-log-group @awsArgs --log-group-name $logGroup 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    $ErrorActionPreference = "SilentlyContinue"
+    aws logs create-log-group @awsArgs --log-group-name $logGroup 2>&1 | Out-Null
+    $logGroupExitCode = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($logGroupExitCode -eq 0) {
         Write-Success "Created log group: $logGroup"
     } else {
         Write-Warning "Log group already exists or creation failed, continuing..."
@@ -280,9 +281,10 @@ function Invoke-Setup {
 
     $taskDefJson = $taskDef | ConvertTo-Json -Depth 10 -Compress
     $taskDefFile = Join-Path $env:TEMP "task-def.json"
-    $taskDefJson | Set-Content $taskDefFile -Encoding UTF8
+    [System.IO.File]::WriteAllText($taskDefFile, $taskDefJson)
 
     aws ecs register-task-definition @awsArgs --cli-input-json "file://$taskDefFile" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Failed to register task definition" }
     Write-Success "Registered task definition: $ServiceName"
 
     # 8. Get default VPC info
@@ -293,7 +295,9 @@ function Invoke-Setup {
 
     # Get or create security group
     $sgName = "$ServiceName-sg"
-    $sgId = aws ec2 describe-security-groups @awsArgs --filters "Name=group-name,Values=$sgName" --query "SecurityGroups[0].GroupId" --output text 2>$null
+    $ErrorActionPreference = "SilentlyContinue"
+    $sgId = aws ec2 describe-security-groups @awsArgs --filters "Name=group-name,Values=$sgName" --query "SecurityGroups[0].GroupId" --output text 2>&1
+    $ErrorActionPreference = "Stop"
 
     if (-not $sgId -or $sgId -eq "None") {
         $sgId = aws ec2 create-security-group @awsArgs `
@@ -303,9 +307,11 @@ function Invoke-Setup {
             --query "GroupId" --output text
 
         # Allow outbound HTTPS (for Discord API)
+        $ErrorActionPreference = "SilentlyContinue"
         aws ec2 authorize-security-group-egress @awsArgs `
             --group-id $sgId `
-            --protocol tcp --port 443 --cidr 0.0.0.0/0 2>$null
+            --protocol tcp --port 443 --cidr 0.0.0.0/0 2>&1 | Out-Null
+        $ErrorActionPreference = "Stop"
 
         Write-Success "Created security group: $sgId"
     } else {
@@ -533,14 +539,20 @@ function Invoke-Teardown {
 
     # Delete log group
     Write-Step "Deleting log group..."
-    aws logs delete-log-group @awsArgs --log-group-name "/ecs/$ServiceName" 2>$null
+    $ErrorActionPreference = "SilentlyContinue"
+    aws logs delete-log-group @awsArgs --log-group-name "/ecs/$ServiceName" 2>&1 | Out-Null
+    $ErrorActionPreference = "Stop"
     Write-Success "Deleted log group"
 
     # Delete security group
     Write-Step "Deleting security group..."
-    $sgId = aws ec2 describe-security-groups @awsArgs --filters "Name=group-name,Values=$ServiceName-sg" --query "SecurityGroups[0].GroupId" --output text 2>$null
+    $ErrorActionPreference = "SilentlyContinue"
+    $sgId = aws ec2 describe-security-groups @awsArgs --filters "Name=group-name,Values=$ServiceName-sg" --query "SecurityGroups[0].GroupId" --output text 2>&1
+    $ErrorActionPreference = "Stop"
     if ($sgId -and $sgId -ne "None") {
-        aws ec2 delete-security-group @awsArgs --group-id $sgId 2>$null
+        $ErrorActionPreference = "SilentlyContinue"
+        aws ec2 delete-security-group @awsArgs --group-id $sgId 2>&1 | Out-Null
+        $ErrorActionPreference = "Stop"
         Write-Success "Deleted security group"
     }
 

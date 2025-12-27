@@ -32,7 +32,7 @@ Before deployment, ensure the following AWS resources exist:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AWS_REGION` | `us-east-1` | AWS region for deployment |
+| `AWS_REGION` | `us-east-2` | AWS region for deployment |
 | `ECR_REPOSITORY` | `soyl-discord-bot` | ECR repository name |
 | `ECS_CLUSTER` | `soyl-cluster` | ECS cluster name |
 | `ECS_SERVICE` | `soyl-discord-bot` | ECS service name |

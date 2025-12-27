@@ -1,6 +1,6 @@
 import { Octokit } from '@octokit/rest';
 import { config } from '../config.js';
-import type { GitHubIssue, SearchResult, PullRequest, WorkflowRun } from '../types.js';
+import type { GitHubIssue, SearchResult, PullRequest, WorkflowRun, WorkflowJob } from '../types.js';
 
 const octokit = new Octokit({
   auth: config.github.token,
@@ -116,23 +116,56 @@ export async function listIssues(
     }));
 }
 
+/**
+ * Returns the count of open issues in the repository (excluding PRs).
+ * Used to determine if @Team should be added to trigger the pipeline.
+ */
+export async function getOpenIssueCount(): Promise<number> {
+  const { data } = await octokit.issues.listForRepo({
+    owner: config.github.owner,
+    repo: config.github.repo,
+    state: 'open',
+    per_page: 100,
+  });
+
+  // Filter out pull requests (GitHub API includes PRs in issues endpoint)
+  return data.filter((issue) => !issue.pull_request).length;
+}
+
+/**
+ * Creates a new GitHub issue with conditional @Team mention.
+ * - If there are zero open issues, appends @Team to trigger the pipeline immediately
+ * - If there are other open issues, creates the issue without @Team (queued for later)
+ * 
+ * Returns both the issue and whether @Team was added.
+ */
 export async function createIssue(
   title: string,
   body: string,
   labels?: string[]
-): Promise<GitHubIssue> {
+): Promise<GitHubIssue & { teamTagged: boolean }> {
   const validLabels = (labels || []).filter((label) =>
     ['bug', 'enhancement', 'question', 'documentation', 'review'].includes(label)
   );
 
-  // Append @claude mention to trigger Claude Code agent on the issue
-  const bodyWithClaude = `${body}\n\n@claude`;
+  // Check if there are any open issues to determine if we should trigger immediately
+  const openIssueCount = await getOpenIssueCount();
+  const shouldTriggerPipeline = openIssueCount === 0;
+
+  // Only append @Team if no other open issues exist (triggers pipeline immediately)
+  const finalBody = shouldTriggerPipeline
+    ? `${body}\n\n@Team`
+    : body;
+
+  console.log(
+    `[GitHub] Creating issue "${title}" - open issues: ${openIssueCount}, @Team: ${shouldTriggerPipeline}`
+  );
 
   const response = await octokit.issues.create({
     owner: config.github.owner,
     repo: config.github.repo,
     title,
-    body: bodyWithClaude,
+    body: finalBody,
     labels: validLabels.length > 0 ? validLabels : undefined,
   });
 
@@ -140,6 +173,7 @@ export async function createIssue(
     number: response.data.number,
     html_url: response.data.html_url,
     title: response.data.title,
+    teamTagged: shouldTriggerPipeline,
   };
 }
 
@@ -221,6 +255,89 @@ export async function getWorkflowRuns(
   }));
 }
 
+/**
+ * Fetches jobs for a specific workflow run.
+ * This provides job-level detail including which agents are actively running.
+ */
+export async function getWorkflowRunJobs(runId: number): Promise<WorkflowJob[]> {
+  try {
+    const { data } = await octokit.actions.listJobsForWorkflowRun({
+      owner: config.github.owner,
+      repo: config.github.repo,
+      run_id: runId,
+    });
+
+    return data.jobs.map((job) => ({
+      id: job.id,
+      name: job.name,
+      status: job.status,
+      conclusion: job.conclusion,
+      started_at: job.started_at,
+      html_url: job.html_url || '',
+    }));
+  } catch (error) {
+    console.error(`[GitHub] Failed to fetch jobs for run ${runId}:`, error);
+    return [];
+  }
+}
+
+/**
+ * Fetches workflow runs with their associated jobs for detailed status tracking.
+ * Returns in-progress runs with job-level information.
+ */
+export async function getActiveWorkflowsWithJobs(limit?: number): Promise<
+  Array<WorkflowRun & { jobs: WorkflowJob[]; issueNumber: number | null }>
+> {
+  // Get in-progress and queued runs
+  const [inProgressRuns, queuedRuns] = await Promise.all([
+    getWorkflowRuns(undefined, 'in_progress', limit || 5),
+    getWorkflowRuns(undefined, 'queued', limit || 5),
+  ]);
+
+  const allActiveRuns = [...inProgressRuns, ...queuedRuns].slice(0, limit || 5);
+
+  // Fetch jobs for each active run in parallel
+  const runsWithJobs = await Promise.all(
+    allActiveRuns.map(async (run) => {
+      const jobs = await getWorkflowRunJobs(run.id);
+
+      // Try to extract issue number from run name (e.g., "Issue Pipeline" processing #42)
+      // or from the workflow run's head_branch which often contains issue number
+      const issueNumber = extractIssueNumberFromRun(run.name);
+
+      return {
+        ...run,
+        jobs,
+        issueNumber,
+      };
+    })
+  );
+
+  return runsWithJobs;
+}
+
+/**
+ * Extracts issue number from workflow run name or context.
+ * Looks for patterns like "#42", "issue-42", "issue 42", etc.
+ */
+function extractIssueNumberFromRun(runName: string): number | null {
+  // Match patterns like #42, issue-42, issue 42
+  const patterns = [
+    /#(\d+)/,
+    /issue[- ]?(\d+)/i,
+    /\[(\d+)\]/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = runName.match(pattern);
+    if (match) {
+      return parseInt(match[1], 10);
+    }
+  }
+
+  return null;
+}
+
 export interface FileUpdateResult {
   path: string;
   sha: string;
@@ -264,4 +381,45 @@ export async function updateFile(
     sha: data.content?.sha || '',
     commitUrl: data.commit.html_url || '',
   };
+}
+
+export interface IssueComment {
+  id: number;
+  body: string;
+  html_url: string;
+}
+
+/**
+ * Adds a comment to an existing GitHub issue.
+ * Used to add @Team to trigger the pipeline on queued issues.
+ */
+export async function addIssueComment(
+  issueNumber: number,
+  body: string
+): Promise<IssueComment> {
+  const { data } = await octokit.issues.createComment({
+    owner: config.github.owner,
+    repo: config.github.repo,
+    issue_number: issueNumber,
+    body,
+  });
+
+  console.log(`[GitHub] Added comment to issue #${issueNumber}`);
+
+  return {
+    id: data.id,
+    body: data.body || '',
+    html_url: data.html_url,
+  };
+}
+
+/**
+ * Triggers the pipeline on an existing issue by adding a @Team comment.
+ * Used when a queued issue is selected to be worked next.
+ */
+export async function triggerIssuePipeline(issueNumber: number): Promise<IssueComment> {
+  return addIssueComment(
+    issueNumber,
+    '@Team\n\nThis issue has been selected to work next.'
+  );
 }
