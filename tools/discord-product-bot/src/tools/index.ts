@@ -483,6 +483,31 @@ export const tools: ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'repo_commit_attachment',
+      description: 'Commit a file attachment (image, screenshot, etc.) to the repository for permanent storage. Use this when creating issues with screenshots - Discord CDN URLs expire, but committed files are permanent. Returns a permanent URL to use in issue bodies.',
+      parameters: {
+        type: 'object',
+        properties: {
+          attachment_url: {
+            type: 'string',
+            description: 'The Discord attachment URL to download and commit',
+          },
+          target_path: {
+            type: 'string',
+            description: 'Path in the repo to store the file (e.g., "docs/assets/issues/screenshot-2024-01-15.png")',
+          },
+          commit_message: {
+            type: 'string',
+            description: 'Commit message describing the file (e.g., "Add screenshot for issue: login button not working")',
+          },
+        },
+        required: ['attachment_url', 'target_path', 'commit_message'],
+      },
+    },
+  },
 
   // Discord-scoped tools
   {

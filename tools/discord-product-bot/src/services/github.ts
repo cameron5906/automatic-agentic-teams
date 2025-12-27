@@ -383,6 +383,106 @@ export async function updateFile(
   };
 }
 
+/**
+ * Creates a new file in the repository.
+ * Use this for files that don't exist yet (no SHA required).
+ * 
+ * @param path - Path where the file should be created
+ * @param content - File content (base64 encoded if isBase64 is true)
+ * @param message - Commit message
+ * @param isBase64 - If true, content is already base64 encoded (for binary files)
+ * @param branch - Target branch (defaults to 'main')
+ */
+export async function createFile(
+  path: string,
+  content: string,
+  message: string,
+  isBase64?: boolean,
+  branch?: string
+): Promise<FileUpdateResult> {
+  // If content is not already base64, encode it
+  const base64Content = isBase64 ? content : Buffer.from(content).toString('base64');
+
+  const { data } = await octokit.repos.createOrUpdateFileContents({
+    owner: config.github.owner,
+    repo: config.github.repo,
+    path,
+    message,
+    content: base64Content,
+    branch: branch || 'main',
+  });
+
+  console.log(`[GitHub] Created file: ${path}`);
+
+  return {
+    path,
+    sha: data.content?.sha || '',
+    commitUrl: data.commit.html_url || '',
+  };
+}
+
+/**
+ * Downloads content from a URL (e.g., Discord CDN attachment).
+ * Returns the content as a Buffer for binary handling.
+ * 
+ * @param url - The URL to download from
+ * @returns Buffer containing the file content
+ */
+export async function downloadAttachment(url: string): Promise<Buffer> {
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`Failed to download attachment: ${response.status} ${response.statusText}`);
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+/**
+ * Result type for committing an attachment to the repository.
+ */
+export interface AttachmentCommitResult {
+  path: string;
+  sha: string;
+  commitUrl: string;
+  /** Permanent raw URL for referencing in markdown */
+  permanentUrl: string;
+}
+
+/**
+ * Downloads an attachment from a URL and commits it to the repository.
+ * Useful for persisting Discord attachments whose URLs expire.
+ * 
+ * @param attachmentUrl - URL of the attachment to download
+ * @param targetPath - Path in the repo where the file should be stored
+ * @param commitMessage - Commit message for the file
+ * @param branch - Target branch (defaults to 'main')
+ */
+export async function commitAttachment(
+  attachmentUrl: string,
+  targetPath: string,
+  commitMessage: string,
+  branch?: string
+): Promise<AttachmentCommitResult> {
+  // Download the attachment
+  const content = await downloadAttachment(attachmentUrl);
+  const base64Content = content.toString('base64');
+
+  // Create the file in the repository
+  const result = await createFile(targetPath, base64Content, commitMessage, true, branch);
+
+  // Build the permanent raw URL for the file
+  const permanentUrl = `https://raw.githubusercontent.com/${config.github.owner}/${config.github.repo}/${branch || 'main'}/${targetPath}`;
+
+  console.log(`[GitHub] Committed attachment to: ${targetPath}`);
+
+  return {
+    ...result,
+    permanentUrl,
+  };
+}
+
 export interface IssueComment {
   id: number;
   body: string;

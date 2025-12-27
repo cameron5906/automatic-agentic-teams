@@ -32,6 +32,7 @@ import {
   repo_list_prs,
   repo_get_workflow_runs,
   repo_get_deployment_status,
+  repo_commit_attachment,
 } from '../tools/repo-tools.js';
 import {
   discord_reply,
@@ -213,6 +214,14 @@ export async function executeToolCall(
       case 'repo_get_deployment_status': {
         const result = await repo_get_deployment_status(
           args.environment as string | undefined
+        );
+        return { success: true, data: result };
+      }
+      case 'repo_commit_attachment': {
+        const result = await repo_commit_attachment(
+          args.attachment_url as string,
+          args.target_path as string,
+          args.commit_message as string
         );
         return { success: true, data: result };
       }

@@ -9,6 +9,8 @@ import {
   getPullRequest,
   listPullRequests,
   getWorkflowRuns,
+  commitAttachment,
+  type AttachmentCommitResult,
 } from '../services/github.js';
 import { trackIssue } from '../services/issue-tracker.js';
 import type {
@@ -110,4 +112,21 @@ export async function repo_get_deployment_status(
     runUrl: latestRun?.html_url,
     timestamp: latestRun?.created_at,
   };
+}
+
+/**
+ * Commits a file attachment (e.g., Discord image) to the repository.
+ * Downloads the file from the provided URL and creates it in the repo.
+ * Returns a permanent URL that can be used in GitHub issues/PRs.
+ * 
+ * @param attachmentUrl - The URL to download the attachment from (e.g., Discord CDN)
+ * @param targetPath - Path in the repo where the file should be stored
+ * @param commitMessage - Commit message describing the file
+ */
+export async function repo_commit_attachment(
+  attachmentUrl: string,
+  targetPath: string,
+  commitMessage: string
+): Promise<AttachmentCommitResult> {
+  return await commitAttachment(attachmentUrl, targetPath, commitMessage);
 }
