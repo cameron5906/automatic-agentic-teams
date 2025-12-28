@@ -160,15 +160,15 @@ export async function registerDomain(
     }
 
     const result = await namecheap.registerDomain(domain, years, {
-      firstName: 'Business',
-      lastName: 'Bot',
-      address1: '123 Main St',
-      city: 'New York',
-      stateProvince: 'NY',
-      postalCode: '10001',
+      firstName: 'Cameron',
+      lastName: 'Cooper',
+      address1: '11908 Cross Winds Way',
+      city: 'Fort Wayne',
+      stateProvince: 'IN',
+      postalCode: '46818',
       country: 'US',
-      phone: '+1.5555555555',
-      email: 'domains@example.com',
+      phone: '+1.2604378544',
+      email: 'cameron@soyl.dev',
     });
 
     if (result.success) {

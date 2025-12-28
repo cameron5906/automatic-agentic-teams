@@ -26,7 +26,7 @@ export const discordTools: ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'discord_setup_channels',
-      description: 'Set up the standard channel structure in a Discord server (standup, product, dev, pull-requests)',
+      description: 'Set up the standard channel structure in a Discord server (standup, product, dev, pull-requests). Also automatically creates webhooks for product, dev, and pull-requests channels. The channel IDs and webhook URLs are stored in the project for use in GitHub configuration.',
       parameters: {
         type: 'object',
         properties: {
@@ -163,6 +163,48 @@ export const discordTools: ChatCompletionTool[] = [
           },
         },
         required: ['topic'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'discord_create_webhook',
+      description: 'Create a webhook for a specific channel in a Discord server. Useful if discord_setup_channels did not create a webhook for a channel.',
+      parameters: {
+        type: 'object',
+        properties: {
+          serverId: {
+            type: 'string',
+            description: 'Discord server ID',
+          },
+          channelName: {
+            type: 'string',
+            description: 'Name of the channel to create the webhook for (e.g., "dev", "product")',
+          },
+          webhookName: {
+            type: 'string',
+            description: 'Optional custom name for the webhook',
+          },
+        },
+        required: ['serverId', 'channelName'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'discord_get_channel_ids',
+      description: 'Get the channel IDs for all standard channels in a Discord server (general, standup, product, dev, pull-requests)',
+      parameters: {
+        type: 'object',
+        properties: {
+          serverId: {
+            type: 'string',
+            description: 'Discord server ID',
+          },
+        },
+        required: ['serverId'],
       },
     },
   },

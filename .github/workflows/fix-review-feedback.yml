@@ -40,12 +40,28 @@ jobs:
   # ==========================================================================
   # STAGE 1: EXTRACT CONTEXT FROM PR
   # ==========================================================================
+  # Debug job to understand why workflow might be skipped
+  debug-event:
+    name: Debug Event
+    runs-on: ubuntu-latest
+    if: github.event.repository.name != 'automatic-agentic-teams'
+    steps:
+      - name: Log event details
+        run: |
+          echo "Event name: ${{ github.event_name }}"
+          echo "Review state: ${{ github.event.review.state }}"
+          echo "Review action: ${{ github.event.action }}"
+          echo "Review user: ${{ github.event.review.user.login }}"
+          echo "PR number: ${{ github.event.pull_request.number }}"
+
   extract-context:
     name: Extract Context
     runs-on: ubuntu-latest
+    needs: [debug-event]
     # Run if: (1) automatic trigger with changes_requested, or (2) manual trigger
     # Never run on template repo
     if: |
+      always() &&
       github.event.repository.name != 'automatic-agentic-teams' &&
       (github.event_name == 'workflow_dispatch' ||
       github.event.review.state == 'changes_requested')
@@ -380,7 +396,7 @@ jobs:
     uses: ./.github/workflows/discord-gpt-message.yml
     with:
       webhook_username: "Avery - Review"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=AveryReview"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=AveryReview1"
       prompt: |
         <@${{ vars.DISCORD_TEAM_LEAD_USER_ID }}> PR #${{ needs.extract-context.outputs.pr_number }} needs your attention
 
@@ -663,7 +679,7 @@ jobs:
     uses: ./.github/workflows/discord-gpt-message.yml
     with:
       webhook_username: "Avery - Review"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=AveryReview"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=AveryReview1"
       prompt: |
         addressing review feedback on PR #${{ needs.extract-context.outputs.pr_number }} (iteration ${{ needs.extract-context.outputs.iteration }}/3)
 
@@ -974,7 +990,7 @@ jobs:
     uses: ./.github/workflows/discord-gpt-message.yml
     with:
       webhook_username: "Avery - Review"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=AveryReview"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=AveryReview1"
       prompt: |
         finished fix iteration ${{ needs.extract-context.outputs.iteration }}/3 for PR #${{ needs.extract-context.outputs.pr_number }}
 

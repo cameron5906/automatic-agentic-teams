@@ -89,22 +89,49 @@ jobs:
           script: |
             const prNumber = parseInt('${{ steps.pr.outputs.number }}');
 
-            const { data: reviews } = await github.rest.pulls.listReviews({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber
-            });
+            // Retry logic to handle GitHub API eventual consistency
+            // When triggered immediately after approval, the API may not return the review yet
+            const maxRetries = 3;
+            const retryDelayMs = 2000;
 
-            // Get latest review per user
-            const latestReviews = {};
-            for (const review of reviews) {
-              latestReviews[review.user.login] = review;
+            let hasApproval = false;
+            let hasRejection = false;
+
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+              const { data: reviews } = await github.rest.pulls.listReviews({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber
+              });
+
+              console.log(`Attempt ${attempt}: Found ${reviews.length} reviews`);
+              for (const r of reviews) {
+                console.log(`  - ${r.user.login}: ${r.state} (submitted at ${r.submitted_at})`);
+              }
+
+              // Get latest review per user
+              const latestReviews = {};
+              for (const review of reviews) {
+                latestReviews[review.user.login] = review;
+              }
+
+              hasApproval = Object.values(latestReviews).some(r => r.state === 'APPROVED');
+              hasRejection = Object.values(latestReviews).some(r => r.state === 'CHANGES_REQUESTED');
+
+              console.log(`Approval status: hasApproval=${hasApproval}, hasRejection=${hasRejection}`);
+
+              // If we found an approval or a rejection, we're done
+              if (hasApproval || hasRejection) {
+                break;
+              }
+
+              // If no reviews found and we have retries left, wait and retry
+              if (attempt < maxRetries) {
+                console.log(`No decisive reviews found, waiting ${retryDelayMs}ms before retry...`);
+                await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+              }
             }
 
-            const hasApproval = Object.values(latestReviews).some(r => r.state === 'APPROVED');
-            const hasRejection = Object.values(latestReviews).some(r => r.state === 'CHANGES_REQUESTED');
-
-            console.log(`Approval status: hasApproval=${hasApproval}, hasRejection=${hasRejection}`);
             core.setOutput('approved', hasApproval && !hasRejection ? 'true' : 'false');
 
       - name: Check CI status
@@ -135,13 +162,27 @@ jobs:
               ref: pr.head.sha
             });
 
-            const failedChecks = checks.check_runs.filter(c => 
+            // Exclude issue-pipeline checks from blocking - the code-reviewer approval
+            // already happened as part of that pipeline, so we trust its judgment.
+            // Also exclude this workflow's own checks to avoid self-blocking.
+            const excludedChecks = ['Issue Pipeline', 'Auto-Merge Approved PRs', 'Check Merge Eligibility'];
+
+            const relevantChecks = checks.check_runs.filter(c =>
+              !excludedChecks.some(name => c.name.includes(name))
+            );
+
+            const failedChecks = relevantChecks.filter(c =>
               c.conclusion === 'failure' || c.conclusion === 'cancelled'
             );
 
-            const pendingChecks = checks.check_runs.filter(c => 
+            const pendingChecks = relevantChecks.filter(c =>
               c.status === 'in_progress' || c.status === 'queued'
             );
+
+            console.log(`Total checks: ${checks.check_runs.length}, Relevant: ${relevantChecks.length}, Pending: ${pendingChecks.length}, Failed: ${failedChecks.length}`);
+            if (pendingChecks.length > 0) {
+              console.log(`Pending checks: ${pendingChecks.map(c => c.name).join(', ')}`);
+            }
 
             if (pendingChecks.length > 0) {
               console.log(`CI pending: ${pendingChecks.length} checks still running`);
@@ -152,12 +193,12 @@ jobs:
               const details = failedChecks.map(c => `- ${c.name}: ${c.conclusion}`).join('\n');
               core.setOutput('status', 'failure');
               core.setOutput('failure_details', details);
-            } else if (status.state === 'success' || checks.check_runs.every(c => c.conclusion === 'success' || c.conclusion === 'skipped')) {
+            } else if (status.state === 'success' || relevantChecks.length === 0 || relevantChecks.every(c => c.conclusion === 'success' || c.conclusion === 'skipped')) {
               console.log('CI passed');
               core.setOutput('status', 'success');
               core.setOutput('failure_details', '');
             } else {
-              console.log('CI status unknown');
+              console.log('CI status unknown, relevant checks:', relevantChecks.map(c => `${c.name}: ${c.status}/${c.conclusion}`).join(', '));
               core.setOutput('status', 'unknown');
               core.setOutput('failure_details', '');
             }
@@ -394,7 +435,7 @@ jobs:
     uses: ./.github/workflows/discord-gpt-message.yml
     with:
       webhook_username: "Avery - Review"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=AveryReview"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=AveryReview1"
       prompt: |
         PR #${{ needs.check-mergeable.outputs.pr_number }} was approved but CI is failing, triggering fix agents
     secrets:
@@ -504,7 +545,7 @@ jobs:
     uses: ./.github/workflows/discord-gpt-message.yml
     with:
       webhook_username: "Jordan - PM"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=JordanPM"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=JordanPM1"
       prompt: |
         <@${{ vars.DISCORD_TEAM_LEAD_USER_ID }}> PR #${{ needs.check-mergeable.outputs.pr_number }} has been merged!
 

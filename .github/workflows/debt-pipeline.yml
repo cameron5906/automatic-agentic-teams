@@ -364,7 +364,7 @@ jobs:
     uses: ./.github/workflows/discord-gpt-message.yml
     with:
       webhook_username: "Quinn - Cleanup"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=QuinnCleanup"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=QuinnCleanup1"
       prompt: |
         finished debt review. processed ${{ needs.curate_debt.outputs.items_count }} items, created ${{ needs.create_issues.result == 'success' && needs.curate_debt.outputs.items_count || '0' }} issues
     secrets:

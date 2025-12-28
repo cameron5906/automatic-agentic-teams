@@ -1,8 +1,8 @@
-import type { Client, Message, ThreadChannel, TextChannel } from 'discord.js';
+import type { Client, Message, TextChannel } from 'discord.js';
 import { ChannelType } from 'discord.js';
 import { handleBotMention } from '../agent/index.js';
 import type { ImageAttachment, MessageContext } from '../types.js';
-import { classifyTicketWorthiness } from '../services/ticket-classifier.js';
+import { classifyIssueType, getIssueTypeEmoji } from '../ticket-flows/issue-classifier.js';
 import { isBotThread, registerBotThread, touchBotThread } from '../context/thread-registry.js';
 import { addMessage, getContextKey } from '../context/conversation-store.js';
 import {
@@ -11,19 +11,50 @@ import {
   processIssueSelection,
 } from '../services/suggestion-service.js';
 import { config } from '../config.js';
+import { getActiveDraft } from '../ticket-flows/flow-controller.js';
+import { uploadAttachment, isS3Enabled } from '../services/s3-attachments.js';
 
 const IMAGE_CONTENT_TYPES = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp'];
 
-function extractImageAttachments(message: Message): ImageAttachment[] {
+function extractImageAttachmentsSync(message: Message): ImageAttachment[] {
   return message.attachments
     .filter(att => att.contentType && IMAGE_CONTENT_TYPES.includes(att.contentType))
     .map(att => ({
-      url: att.url,
+      url: att.proxyURL,
       name: att.name ?? 'image',
       contentType: att.contentType!,
       width: att.width ?? undefined,
       height: att.height ?? undefined,
     }));
+}
+
+/**
+ * Extracts image attachments and uploads them to S3 for permanent URLs.
+ * The permanent URLs can be used directly in GitHub issues.
+ */
+async function extractAndUploadImages(message: Message): Promise<ImageAttachment[]> {
+  const images = extractImageAttachmentsSync(message);
+
+  if (images.length === 0 || !isS3Enabled()) {
+    return images;
+  }
+
+  // Upload each image to S3 in parallel
+  const uploadResults = await Promise.allSettled(
+    images.map(async (img) => {
+      try {
+        const result = await uploadAttachment(img.url, img.name);
+        return { ...img, permanentUrl: result.publicUrl };
+      } catch (error) {
+        console.error(`[ProductChannel] Failed to upload image ${img.name}:`, error);
+        return img; // Return without permanent URL on failure
+      }
+    })
+  );
+
+  return uploadResults.map((result, i) =>
+    result.status === 'fulfilled' ? result.value : images[i]
+  );
 }
 
 function extractThreadId(message: Message): string | null {
@@ -143,6 +174,8 @@ export async function handleProductMessage(
       .replace(new RegExp(`<@!?${client.user!.id}>`, 'g'), '')
       .trim();
 
+    const images = await extractAndUploadImages(message);
+
     const context: MessageContext = {
       message,
       client,
@@ -150,7 +183,7 @@ export async function handleProductMessage(
       authorId: message.author.id,
       channelId: message.channelId,
       threadId,
-      images: extractImageAttachments(message),
+      images,
     };
 
     touchBotThread(threadId);
@@ -176,34 +209,37 @@ export async function handleProductMessage(
   // and continue *only* inside it (GitHub is the team's primary comms surface).
   if (!threadId) {
     try {
-      const classification = await classifyTicketWorthiness({
+      const classification = await classifyIssueType({
         content,
         author: message.author.username,
       });
 
-      if (classification.isTicketWorthy) {
+      if (classification.isTicketWorthy && classification.issueType) {
+        const emoji = getIssueTypeEmoji(classification.issueType);
+        const threadName = classification.suggestedThreadName.slice(0, 100);
+
         const thread = await message.startThread({
-          name: classification.suggestedThreadName.slice(0, 100),
+          name: threadName,
           autoArchiveDuration: 1440,
         });
         registerBotThread(thread.id);
 
-        // Seed thread-specific context with the classifier summary so we retain intent
-        // even as the main channel moves on.
+        // Seed thread-specific context with the classifier summary and issue type
         const contextKey = getContextKey(message.channelId, thread.id);
         addMessage(
           contextKey,
           'assistant',
-          `Ticket triage: ${classification.reason}`,
+          `Ticket triage: ${classification.reason}\nIssue type: ${classification.issueType} (${classification.confidence} confidence)`,
           client.user?.id ?? 'bot',
           client.user?.username ?? 'Bot'
         );
 
-        // Anchor message ensures that any `discord_reply` tool call replies in-thread,
-        // not in the main channel.
+        // Anchor message with issue type indication
         const anchor = await thread.send(
-          `Starting a thread for this ticketable request. We'll continue here.`
+          `${emoji} Starting a thread for this **${classification.issueType}** request. I'll collect the details we need.`
         );
+
+        const images = await extractAndUploadImages(message);
 
         const context: MessageContext = {
           message: anchor,
@@ -212,9 +248,8 @@ export async function handleProductMessage(
           authorId: message.author.id,
           channelId: message.channelId,
           threadId: thread.id,
-          images: extractImageAttachments(message),
+          images,
           shouldReply: false,
-          // Signal that this is thread creation - agent should consolidate to one message
           isThreadCreation: true,
         };
 
@@ -222,9 +257,11 @@ export async function handleProductMessage(
         return;
       }
     } catch (error) {
-      console.error('Ticket-worthiness classification failed; continuing normally:', error);
+      console.error('Issue classification failed; continuing normally:', error);
     }
   }
+
+  const images = await extractAndUploadImages(message);
 
   const context: MessageContext = {
     message,
@@ -233,7 +270,7 @@ export async function handleProductMessage(
     authorId: message.author.id,
     channelId: message.channelId,
     threadId,
-    images: extractImageAttachments(message),
+    images,
   };
 
   await handleBotMention(content, context);

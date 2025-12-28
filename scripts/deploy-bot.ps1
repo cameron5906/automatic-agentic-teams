@@ -9,7 +9,7 @@
     - Starting, stopping, and updating the service
 
 .PARAMETER Action
-    The action to perform: setup, deploy, start, stop, status, logs, teardown
+    The action to perform: setup, deploy, start, stop, status, logs, teardown, attachments-setup
 
 .PARAMETER Profile
     Required. The AWS CLI profile to use for all commands.
@@ -34,11 +34,14 @@
 
 .EXAMPLE
     .\deploy-bot.ps1 -Action status -Profile myprofile
+
+.EXAMPLE
+    .\deploy-bot.ps1 -Action attachments-setup -Profile myprofile
 #>
 
 param(
     [Parameter(Mandatory=$true)]
-    [ValidateSet("setup", "deploy", "start", "stop", "status", "logs", "teardown")]
+    [ValidateSet("setup", "deploy", "start", "stop", "status", "logs", "teardown", "attachments-setup")]
     [string]$Action,
 
     [Parameter(Mandatory=$true)]
@@ -47,7 +50,8 @@ param(
     [string]$Region = "us-east-2",
     [string]$ClusterName = "soyl-cluster",
     [string]$ServiceName = "soyl-discord-bot",
-    [string]$RepoName = "soyl-discord-bot"
+    [string]$RepoName = "soyl-discord-bot",
+    [string]$AttachmentsBucket = "soyl-issue-attachments"
 )
 
 $ErrorActionPreference = "Stop"
@@ -489,6 +493,170 @@ function Invoke-Logs {
 }
 
 # ============================================================================
+# ATTACHMENTS-SETUP - Create S3 bucket for issue attachments
+# ============================================================================
+function Invoke-AttachmentsSetup {
+    Write-Step "Setting up S3 bucket for issue attachments..."
+
+    $accountId = Get-AccountId
+    Write-Success "Using AWS Account: $accountId"
+
+    # 1. Check if bucket exists
+    Write-Step "Checking if bucket '$AttachmentsBucket' exists..."
+    $ErrorActionPreference = "SilentlyContinue"
+    $bucketExists = aws s3api head-bucket --profile $Profile --bucket $AttachmentsBucket 2>&1
+    $bucketExistsCode = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+
+    if ($bucketExistsCode -eq 0) {
+        Write-Warning "Bucket '$AttachmentsBucket' already exists."
+    } else {
+        # Create bucket (us-east-1 doesn't need LocationConstraint)
+        Write-Step "Creating S3 bucket..."
+        if ($Region -eq "us-east-1") {
+            aws s3api create-bucket --profile $Profile --bucket $AttachmentsBucket --region $Region | Out-Null
+        } else {
+            aws s3api create-bucket --profile $Profile --bucket $AttachmentsBucket --region $Region `
+                --create-bucket-configuration LocationConstraint=$Region | Out-Null
+        }
+        if ($LASTEXITCODE -ne 0) { throw "Failed to create S3 bucket" }
+        Write-Success "Created bucket: $AttachmentsBucket"
+    }
+
+    # 2. Disable block public access
+    Write-Step "Configuring public access settings..."
+    aws s3api put-public-access-block --profile $Profile --bucket $AttachmentsBucket `
+        --public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Failed to configure public access" }
+    Write-Success "Configured public access block settings"
+
+    # 3. Add bucket policy for public read
+    Write-Step "Setting bucket policy for public read..."
+    $bucketPolicyFile = Join-Path $env:TEMP "bucket-policy.json"
+    $bucketPolicyJson = @"
+{
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Sid": "PublicReadGetObject",
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::$AttachmentsBucket/*"
+    }]
+}
+"@
+    [System.IO.File]::WriteAllText($bucketPolicyFile, $bucketPolicyJson)
+
+    aws s3api put-bucket-policy --profile $Profile --bucket $AttachmentsBucket --policy "file://$bucketPolicyFile" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Failed to set bucket policy" }
+    Write-Success "Applied public read bucket policy"
+
+    # 4. Add S3 write permission to ECS task execution role
+    Write-Step "Adding S3 write permission to ECS task role..."
+    $executionRoleName = "ecs-task-execution-role"
+
+    $s3PolicyFile = Join-Path $env:TEMP "s3-write-policy.json"
+    $s3PolicyJson = @"
+{
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Allow",
+        "Action": ["s3:PutObject"],
+        "Resource": "arn:aws:s3:::$AttachmentsBucket/*"
+    }]
+}
+"@
+    [System.IO.File]::WriteAllText($s3PolicyFile, $s3PolicyJson)
+
+    $ErrorActionPreference = "SilentlyContinue"
+    aws iam put-role-policy --profile $Profile `
+        --role-name $executionRoleName `
+        --policy-name "S3AttachmentsWriteAccess" `
+        --policy-document "file://$s3PolicyFile" 2>&1 | Out-Null
+    $iamExitCode = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+
+    if ($iamExitCode -eq 0) {
+        Write-Success "Added S3 write permission to $executionRoleName"
+    } else {
+        Write-Warning "Could not add IAM policy. You may need to add it manually."
+        Write-Host "   Role: $executionRoleName" -ForegroundColor Yellow
+        Write-Host "   Policy: S3AttachmentsWriteAccess" -ForegroundColor Yellow
+    }
+
+    # 5. Update task definition with S3 environment variables
+    Write-Step "Updating task definition with S3 configuration..."
+
+    # Get current task definition
+    $ErrorActionPreference = "SilentlyContinue"
+    $taskDefJson = aws ecs describe-task-definition --profile $Profile --region $Region --task-definition $ServiceName --query "taskDefinition" 2>&1
+    $taskDefExitCode = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+
+    if ($taskDefExitCode -eq 0) {
+        $taskDef = $taskDefJson | ConvertFrom-Json
+
+        # Check if S3 env vars already exist
+        $existingEnv = $taskDef.containerDefinitions[0].environment
+        $hasS3Bucket = $existingEnv | Where-Object { $_.name -eq "S3_ATTACHMENTS_BUCKET" }
+
+        if (-not $hasS3Bucket) {
+            # Add S3 environment variables
+            $newEnv = @($existingEnv) + @(
+                @{ name = "S3_ATTACHMENTS_BUCKET"; value = $AttachmentsBucket }
+                @{ name = "S3_ATTACHMENTS_REGION"; value = $Region }
+            )
+
+            # Create new task definition
+            $newTaskDef = @{
+                family = $taskDef.family
+                networkMode = $taskDef.networkMode
+                requiresCompatibilities = $taskDef.requiresCompatibilities
+                cpu = $taskDef.cpu
+                memory = $taskDef.memory
+                executionRoleArn = $taskDef.executionRoleArn
+                containerDefinitions = @(
+                    @{
+                        name = $taskDef.containerDefinitions[0].name
+                        image = $taskDef.containerDefinitions[0].image
+                        essential = $taskDef.containerDefinitions[0].essential
+                        environment = $newEnv
+                        secrets = $taskDef.containerDefinitions[0].secrets
+                        logConfiguration = $taskDef.containerDefinitions[0].logConfiguration
+                    }
+                )
+            }
+
+            $newTaskDefFile = Join-Path $env:TEMP "task-def-updated.json"
+            $newTaskDef | ConvertTo-Json -Depth 10 -Compress | Set-Content $newTaskDefFile
+
+            aws ecs register-task-definition --profile $Profile --region $Region --cli-input-json "file://$newTaskDefFile" | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Success "Registered updated task definition with S3 configuration"
+                Write-Warning "Run 'deploy' to update the running service with the new configuration."
+            } else {
+                Write-Warning "Could not update task definition. You may need to add S3 env vars manually."
+            }
+        } else {
+            Write-Success "Task definition already has S3 configuration"
+        }
+    } else {
+        Write-Warning "Could not find task definition. Run 'setup' first, then re-run 'attachments-setup'."
+    }
+
+    # Summary
+    Write-Step "Attachments setup complete!"
+    Write-Host ""
+    Write-Host "   S3 Bucket: $AttachmentsBucket" -ForegroundColor White
+    Write-Host "   Region:    $Region" -ForegroundColor White
+    Write-Host "   URL Format: https://$AttachmentsBucket.s3.$Region.amazonaws.com/issues/<file>" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "   Next steps:" -ForegroundColor White
+    Write-Host "   1. Run: .\deploy-bot.ps1 -Action deploy -Profile $Profile  (to update the service)" -ForegroundColor Yellow
+    Write-Host ""
+}
+
+# ============================================================================
 # TEARDOWN - Remove all infrastructure
 # ============================================================================
 function Invoke-Teardown {
@@ -575,13 +743,14 @@ Write-Host "Discord Bot Deployment Script" -ForegroundColor Magenta
 Write-Host "==============================" -ForegroundColor Magenta
 
 switch ($Action) {
-    "setup"    { Invoke-Setup }
-    "deploy"   { Invoke-Deploy }
-    "start"    { Invoke-Start }
-    "stop"     { Invoke-Stop }
-    "status"   { Invoke-Status }
-    "logs"     { Invoke-Logs }
-    "teardown" { Invoke-Teardown }
+    "setup"             { Invoke-Setup }
+    "deploy"            { Invoke-Deploy }
+    "start"             { Invoke-Start }
+    "stop"              { Invoke-Stop }
+    "status"            { Invoke-Status }
+    "logs"              { Invoke-Logs }
+    "teardown"          { Invoke-Teardown }
+    "attachments-setup" { Invoke-AttachmentsSetup }
 }
 
 Write-Host ""

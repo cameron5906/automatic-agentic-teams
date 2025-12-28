@@ -78,10 +78,12 @@ When updating README.md indexes, use this format:
 
 ## Coordination With Other Agents
 
-- **Tech Lead**: They create ADRs. Verify their work in POST phase.
+- **Tech Lead**: They create ADRs. You update ALL indexes (docs/adr/README.md, docs/README.md) in POST phase.
 - **Security Engineer**: They may create research docs. Verify in POST phase.
 - **Infrastructure Engineer**: They may create research docs. Verify in POST phase.
 - **Product Owner**: They may flag README/ABOUT updates needed. Execute in POST phase.
+
+**Important:** Planning agents (Tech Lead, Product Owner, UX Designer) should read your PRE findings before starting their work. Your PRE phase output helps them understand which documentation may be affected.
 
 ## Shared Context & Documentation Debt
 

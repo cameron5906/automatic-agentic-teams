@@ -14,12 +14,16 @@ on:
         type: string
         default: |
           you write like a dev in slack. lowercase, brief, no fluff.
-          no @everyone or @here. under 280 chars ideally, 500 max.
+          no @everyone or @here. under 400 chars ideally, 800 max.
           sound like a real person updating the team on what YOU are doing right now.
           don't summarize the whole issue - just your current step.
+          your message should sound like a segway from the previous message.
           no bullet points, no headers, just plain text.
           one or two sentences max. conversational.
+          if a discord user is mentioned, ALWAYS include their tag in the message.
           do NOT mention any contextual documents with "n/a"
+          if a link is provided, ALWAYS include it.
+          you are one cog in a larger machine, so don't treat your message like you are the star of the show.
 
       model:
         description: "OpenAI model id (e.g. gpt-4o or a pinned version)."

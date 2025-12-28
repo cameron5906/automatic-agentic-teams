@@ -282,6 +282,7 @@ export async function setupChannels(serverId: string): Promise<ToolResult> {
     const permCheck = checkGuildPermissions(guild, [
       PermissionFlagsBits.ManageChannels,
       PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.ManageWebhooks,
     ]);
     if (!permCheck.hasPermission) {
       return {
@@ -292,6 +293,8 @@ export async function setupChannels(serverId: string): Promise<ToolResult> {
 
     const channelNames = ['standup', 'product', 'dev', 'pull-requests'];
     const createdChannels: string[] = [];
+    const channelIds: Record<string, string> = {};
+    const webhooks: Record<string, string> = {};
 
     let category = guild.channels.cache.find(
       (ch) => ch.type === ChannelType.GuildCategory && ch.name.toLowerCase() === 'project'
@@ -305,17 +308,31 @@ export async function setupChannels(serverId: string): Promise<ToolResult> {
     }
 
     for (const name of channelNames) {
-      const exists = guild.channels.cache.find(
+      let channel = guild.channels.cache.find(
         (ch) => ch.type === ChannelType.GuildText && ch.name === name
-      );
+      ) as TextChannel | undefined;
 
-      if (!exists) {
-        await guild.channels.create({
+      if (!channel) {
+        channel = await guild.channels.create({
           name,
           type: ChannelType.GuildText,
           parent: category.id,
-        });
+        }) as TextChannel;
         createdChannels.push(name);
+      }
+
+      channelIds[name] = channel.id;
+
+      if (['product', 'dev', 'pull-requests'].includes(name)) {
+        try {
+          const webhook = await channel.createWebhook({
+            name: `${guild.name} - ${name}`,
+            reason: 'Auto-created for CI/CD pipeline notifications',
+          });
+          webhooks[name] = webhook.url;
+        } catch (webhookError) {
+          console.error(`Failed to create webhook for #${name}:`, webhookError);
+        }
       }
     }
 
@@ -329,6 +346,8 @@ export async function setupChannels(serverId: string): Promise<ToolResult> {
         serverId,
         serverName: guild.name,
         channels: channelNames,
+        channelIds,
+        webhooks,
       });
     }
 
@@ -343,6 +362,8 @@ export async function setupChannels(serverId: string): Promise<ToolResult> {
       }) as TextChannel;
     }
 
+    channelIds['general'] = generalChannel.id;
+
     if (generalChannel) {
       const welcomeEmbed = buildWelcomeEmbed(matchingProject ?? null, guild.name, serverId);
       await generalChannel.send({ embeds: [welcomeEmbed] });
@@ -354,16 +375,140 @@ export async function setupChannels(serverId: string): Promise<ToolResult> {
         serverId,
         createdChannels,
         allChannels: [...channelNames, 'general'],
+        channelIds,
+        webhooks: {
+          product: webhooks['product'] ? '✓ Created' : '✗ Failed',
+          dev: webhooks['dev'] ? '✓ Created' : '✗ Failed',
+          'pull-requests': webhooks['pull-requests'] ? '✓ Created' : '✗ Failed',
+        },
+        webhooksReady: Object.keys(webhooks).length === 3,
         welcomeMessageSent: true,
         message: createdChannels.length > 0
-          ? `Created channels: ${createdChannels.join(', ')}. Welcome message posted in #general.`
-          : 'All standard channels already exist. Welcome message posted in #general.',
+          ? `Created channels: ${createdChannels.join(', ')}. Webhooks created for product, dev, and pull-requests. Welcome message posted in #general.`
+          : 'All standard channels already exist. Webhooks created. Welcome message posted in #general.',
       },
     };
   } catch (error) {
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Failed to setup channels',
+    };
+  }
+}
+
+export async function createWebhook(
+  serverId: string,
+  channelName: string,
+  webhookName?: string
+): Promise<ToolResult> {
+  try {
+    const client = getClient();
+    const guild = client.guilds.cache.get(serverId);
+
+    if (!guild) {
+      return {
+        success: false,
+        error: `Server ${serverId} not found`,
+      };
+    }
+
+    const permCheck = checkGuildPermissions(guild, [
+      PermissionFlagsBits.ManageWebhooks,
+    ]);
+    if (!permCheck.hasPermission) {
+      return {
+        success: false,
+        error: `Missing permissions: ${permCheck.missing.join(', ')}`,
+      };
+    }
+
+    const channel = guild.channels.cache.find(
+      (ch) => ch.type === ChannelType.GuildText && ch.name === channelName
+    ) as TextChannel | undefined;
+
+    if (!channel) {
+      return {
+        success: false,
+        error: `Channel #${channelName} not found in server`,
+      };
+    }
+
+    const webhook = await channel.createWebhook({
+      name: webhookName ?? `${guild.name} - ${channelName}`,
+      reason: 'Created by Business Bot for CI/CD pipeline',
+    });
+
+    const projects = projectStore.listProjects();
+    const matchingProject = projects.find(
+      (p) => p.resources.discord?.serverId === serverId
+    );
+
+    if (matchingProject && matchingProject.resources.discord) {
+      const existingWebhooks = matchingProject.resources.discord.webhooks ?? {};
+      projectStore.setDiscordResource(matchingProject.id, {
+        ...matchingProject.resources.discord,
+        webhooks: {
+          ...existingWebhooks,
+          [channelName]: webhook.url,
+        },
+      });
+    }
+
+    return {
+      success: true,
+      data: {
+        channelId: channel.id,
+        channelName,
+        webhookId: webhook.id,
+        webhookUrl: webhook.url,
+        message: `Created webhook for #${channelName}`,
+      },
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to create webhook',
+    };
+  }
+}
+
+export async function getChannelIds(serverId: string): Promise<ToolResult> {
+  try {
+    const client = getClient();
+    const guild = client.guilds.cache.get(serverId);
+
+    if (!guild) {
+      return {
+        success: false,
+        error: `Server ${serverId} not found`,
+      };
+    }
+
+    const channelIds: Record<string, string> = {};
+    const targetChannels = ['general', 'standup', 'product', 'dev', 'pull-requests'];
+
+    for (const name of targetChannels) {
+      const channel = guild.channels.cache.find(
+        (ch) => ch.type === ChannelType.GuildText && ch.name === name
+      );
+      if (channel) {
+        channelIds[name] = channel.id;
+      }
+    }
+
+    return {
+      success: true,
+      data: {
+        serverId,
+        serverName: guild.name,
+        channelIds,
+        message: `Found ${Object.keys(channelIds).length} channel IDs`,
+      },
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to get channel IDs',
     };
   }
 }

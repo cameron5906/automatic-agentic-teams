@@ -27,6 +27,8 @@ export interface ImageAttachment {
   contentType: string;
   width?: number;
   height?: number;
+  /** Permanent URL after uploading to S3 (for embedding in issues) */
+  permanentUrl?: string;
 }
 
 export interface ConversationMessage {

@@ -586,6 +586,167 @@ export const tools: ChatCompletionTool[] = [
       },
     },
   },
+
+  // Ticket flow tools
+  {
+    type: 'function',
+    function: {
+      name: 'ticket_start_flow',
+      description: 'Start a new ticket creation flow. Classifies the request and creates a draft. Must be in a thread.',
+      parameters: {
+        type: 'object',
+        properties: {
+          content: {
+            type: 'string',
+            description: 'The initial request content to classify and start the flow',
+          },
+        },
+        required: ['content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'update_draft',
+      description: 'Update a field in the draft, refresh the draft embed, and reply to the draft message. This is the ONLY tool to use when updating draft fields - it handles everything automatically.',
+      parameters: {
+        type: 'object',
+        properties: {
+          field_name: {
+            type: 'string',
+            description: 'The field name to update (e.g., "problem", "reproductionSteps", "severity")',
+          },
+          value: {
+            type: 'string',
+            description: 'The value for the field. For list fields, separate items with newlines.',
+          },
+          reply_message: {
+            type: 'string',
+            description: 'Brief message to reply with (e.g., "✅ Updated severity to P0. Ready to file!")',
+          },
+        },
+        required: ['field_name', 'value', 'reply_message'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'ticket_get_draft',
+      description: 'Get the current draft status including which fields are filled and which are missing.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'ticket_get_draft_message',
+      description: 'Get the formatted draft message content to post/update in Discord.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'ticket_preview',
+      description: 'Get a preview of the final issue body before filing.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'ticket_file_issue',
+      description: 'File the current draft as a GitHub issue. The draft must be complete (all required fields filled).',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'ticket_cancel',
+      description: 'Cancel the current draft and discard it.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'ticket_decompose_epic',
+      description: 'For epic drafts only: decompose the epic into child issues. Shows a preview of the breakdown.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'ticket_file_epic_with_children',
+      description: 'File an epic and all its child issues. Must call ticket_decompose_epic first.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'ticket_list_types',
+      description: 'List all available issue types with their required fields.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'ticket_get_field_info',
+      description: 'Get detailed information about a specific field for an issue type.',
+      parameters: {
+        type: 'object',
+        properties: {
+          issue_type: {
+            type: 'string',
+            description: 'The issue type (e.g., "feature", "bug", "task")',
+          },
+          field_name: {
+            type: 'string',
+            description: 'The field name to get info about',
+          },
+        },
+        required: ['issue_type', 'field_name'],
+      },
+    },
+  },
 ];
 
 export const toolNames = tools.map((t) => t.function.name);

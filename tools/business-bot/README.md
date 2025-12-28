@@ -181,11 +181,32 @@ To enable this integration:
 2. Set the `PRODUCT_BOT_CLIENT_ID` environment variable
 3. When servers are created, users can click the invite link in the welcome message
 
-## Pipeline Secrets Configuration
+## Automatic Repository Configuration
 
-When the Business Bot forks the github-auto-team template for a new project, it can automatically configure all the required secrets and variables needed for the CI/CD pipelines to run.
+When the Business Bot creates a repository from the template, it automatically scaffolds configuration by:
 
-### Required Secrets
+1. **Discovering** what secrets and variables are configured on the template repository
+2. **Copying variables** directly from the template (values are readable)
+3. **Identifying secrets** that need user-provided values (secret values cannot be read from GitHub)
+4. **Prompting for missing secrets** so the user can provide values
+
+This dynamic approach means the bot always stays in sync with whatever the template has configured, without needing hardcoded lists of secrets/variables.
+
+### Automatic Flow
+
+```
+User: Create a repo for my project from the template
+Bot: [Creates repo, copies variables, identifies missing secrets]
+     Created repo my-org/my-project from template.
+     Copied 4 variables from template.
+     The following secrets need to be configured: ANTHROPIC_API_KEY, CLAUDE_WORKFLOW_TOKEN, ...
+
+User: Here's my Anthropic key: sk-ant-...
+Bot: [Sets the secret]
+     Set ANTHROPIC_API_KEY. Still need: CLAUDE_WORKFLOW_TOKEN, ...
+```
+
+### Common Secrets (discovered from template)
 
 | Secret | Description |
 |--------|-------------|
@@ -194,8 +215,9 @@ When the Business Bot forks the github-auto-team template for a new project, it 
 | `DISCORD_DEV_WEBHOOK_URL` | Webhook URL for #dev channel updates |
 | `DISCORD_PRODUCT_WEBHOOK_URL` | Webhook URL for #product channel updates |
 | `OPENAI_API_KEY` | OpenAI API key for issue relay (optional) |
+| `DISCORD_E2E_WEBHOOK_URL` | Webhook URL for E2E test result notifications (optional) |
 
-### Required Variables
+### Common Variables (auto-copied from template)
 
 | Variable | Description |
 |----------|-------------|
@@ -203,20 +225,16 @@ When the Business Bot forks the github-auto-team template for a new project, it 
 | `DISCORD_DEV_CHANNEL_ID` | #dev channel ID |
 | `DISCORD_PR_CHANNEL_ID` | #pull-requests channel ID |
 | `DISCORD_TEAM_LEAD_USER_ID` | User ID to ping for approvals |
+| `APP_PUBLIC_DOMAIN` | Public URL of the deployed app for E2E testing (optional) |
 
-### Usage
+### Manual Configuration
 
-After forking a repository, ask the bot to configure the secrets:
+You can also manually scaffold or check template config:
 
 ```
-@BusinessBot Configure the pipeline secrets for my project
+@BusinessBot What secrets does the template need?
+@BusinessBot Set ANTHROPIC_API_KEY to sk-ant-xxx for my project
 ```
-
-The bot will:
-1. Ask for the required API keys and tokens
-2. Request approval before setting secrets
-3. Configure all secrets and variables on the repository
-4. Report which secrets were successfully set
 
 ### Discord Webhooks
 
@@ -230,6 +248,25 @@ To get webhook URLs for your Discord channels:
 The `CLAUDE_WORKFLOW_TOKEN` needs these scopes:
 - `repo` (full repository access)
 - `workflow` (update GitHub Actions workflows)
+
+### E2E Testing Configuration
+
+For projects that want automated E2E browser testing after deployments:
+
+1. **Deploy Skyvern infrastructure** (one-time per AWS account):
+   ```powershell
+   .\scripts\deploy-skyvern.ps1 -Profile "aws-profile" -GithubOrg "your-org"
+   ```
+
+2. **Set org-level variables** (shared across all projects):
+   - `AWS_REGION`, `SKYVERN_CLUSTER`, `SKYVERN_TASK_DEF`, `SKYVERN_TASK_ROLE_ARN`
+   - `SKYVERN_SUBNETS`, `SKYVERN_SECURITY_GROUP`, `SKYVERN_ARTIFACTS_BUCKET`
+
+3. **Per-project configuration** (set by Business Bot):
+   - `DISCORD_E2E_WEBHOOK_URL` - Webhook for E2E test notifications
+   - `APP_PUBLIC_DOMAIN` - Public URL of the deployed application
+
+See `docs/automation/e2e-testing.md` for full documentation.
 
 ## Usage
 
@@ -274,6 +311,7 @@ The `CLAUDE_WORKFLOW_TOKEN` needs these scopes:
 ### GitHub
 - `github_list_repos` - List repositories
 - `github_create_repo` - Create repository (approval required)
+- `github_create_repo_from_template` - Create from template with auto-scaffolding (approval required)
 - `github_fork_repo` - Fork repository (approval required)
 - `github_delete_repo` - Delete repository (approval required)
 - `github_update_repo` - Update repository settings
@@ -283,6 +321,8 @@ The `CLAUDE_WORKFLOW_TOKEN` needs these scopes:
 - `github_set_secret` - Set an Actions secret
 - `github_set_variable` - Set an Actions variable
 - `github_configure_pipeline_secrets` - Configure all pipeline secrets/variables (approval required)
+- `github_scaffold_repo_config` - Scaffold secrets/variables from template (auto-called on repo creation)
+- `github_get_template_config` - View what the template has configured
 
 ### Discord
 - `discord_create_server` - Create server (approval required)

@@ -47,6 +47,17 @@ on:
         required: false
         type: string
         default: "1"
+      # Resume mode inputs (for clarification response handling)
+      is_resume:
+        description: "Whether this is a resumed run after clarification"
+        required: false
+        type: string
+        default: "false"
+      clarification_response:
+        description: "The clarification response from human (for resumed runs)"
+        required: false
+        type: string
+        default: ""
     outputs:
       result:
         description: "Agent output result"
@@ -109,6 +120,16 @@ jobs:
           npm ci
           npm run build
 
+      - name: Build MCP Clarification (outside git worktree)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/mcp-clarification
+          cp -R tools/mcp-clarification /tmp/mcp-clarification
+          cd /tmp/mcp-clarification
+          npm ci
+          npm run build
+
       - name: Create MCP config
         shell: bash
         run: |
@@ -140,6 +161,20 @@ jobs:
                   "DISCORD_WEBHOOK_URL": "${{ secrets.DISCORD_DEV_WEBHOOK_URL }}",
                   "DISCORD_DEFAULT_CHANNEL_ID": "${{ vars.DISCORD_DEV_CHANNEL_ID || '1453129264118370434' }}",
                   "AGENT_NAME": "$PERSONA"
+                }
+              },
+              "clarification": {
+                "command": "node",
+                "args": ["/tmp/mcp-clarification/dist/index.js"],
+                "env": {
+                  "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+                  "GITHUB_REPOSITORY": "${{ github.repository }}",
+                  "GITHUB_RUN_ID": "${{ github.run_id }}",
+                  "GITHUB_SERVER_URL": "${{ github.server_url }}",
+                  "ISSUE_NUMBER": "${{ inputs.issue_number }}",
+                  "TEAM_LEAD_USERNAME": "${{ vars.TEAM_LEAD_USERNAME || '' }}",
+                  "AGENT_NAME": "$PERSONA",
+                  "AGENT_PHASE": "${{ inputs.phase }}"
                 }
               }
             }
@@ -316,8 +351,8 @@ jobs:
               ;;
           esac
 
-          # MCP Discord tool - all agents get this
-          MCP_ALLOWED="mcp__discord__discord_post_dev_update"
+          # MCP tools - all agents get these
+          MCP_ALLOWED="mcp__discord__discord_post_dev_update,mcp__clarification__request_clarification"
 
           # ================================================================
           # WRITE SETTINGS FILE
@@ -422,14 +457,23 @@ jobs:
               return;
             }
 
-            let prompts = JSON.parse(raw);
-            if (typeof prompts === 'string') prompts = JSON.parse(prompts);
+            try {
+              let prompts = JSON.parse(raw);
+              if (typeof prompts === 'string') prompts = JSON.parse(prompts);
 
-            const agentConfig = prompts[agentName] || {};
-            core.setOutput('task', agentConfig.prompt || 'No specific task assigned. Use your role + phase instructions to proceed.');
-            core.setOutput('phase_config', agentConfig.phase || '${{ inputs.phase }}');
+              const agentConfig = prompts[agentName] || {};
+              core.setOutput('task', agentConfig.prompt || 'No specific task assigned. Use your role + phase instructions to proceed.');
+              core.setOutput('phase_config', agentConfig.phase || '${{ inputs.phase }}');
+            } catch (e) {
+              console.log(`Warning: Failed to parse agent_prompts JSON: ${e.message}`);
+              console.log(`Raw input (first 500 chars): ${raw.slice(0, 500)}`);
+              core.setOutput('task', 'No specific task assigned (JSON parse failed). Use your role + phase instructions to proceed.');
+              core.setOutput('phase_config', '${{ inputs.phase }}');
+            }
 
       - name: Build system prompt file
+        env:
+          CLARIFICATION_RESPONSE_TEXT: ${{ inputs.clarification_response }}
         run: |
           cat << 'EOF' > /tmp/system_prompt.txt
           # Agent: ${{ inputs.agent_name }}
@@ -559,6 +603,57 @@ jobs:
           - do NOT mention any contextual documents with "n/a"
           - post when you have something meaningful to share, not just to fill silence
           DISCORD_EOF
+
+          # Add Clarification MCP tool instructions for all agents
+          cat << 'CLARIFICATION_EOF' >> /tmp/system_prompt.txt
+
+          ## Clarification Requests (MCP Tool)
+          You have access to the `request_clarification` MCP tool to ask humans for information when you're blocked.
+
+          **USE THIS TOOL WHEN:**
+          - You need API keys, credentials, or secrets that weren't provided in the issue
+          - Requirements are ambiguous and you need a human decision
+          - You need access to external resources or services you don't have
+          - The issue description is missing critical information you cannot infer
+
+          **DO NOT USE FOR:**
+          - Questions you can answer by reading the codebase
+          - Implementation decisions you can reasonably make yourself
+          - Things that are clearly specified in the issue or planning context
+          - Stylistic choices or preferences - make a reasonable decision
+
+          **How it works:**
+          1. The tool posts a comment on the issue tagging the team lead
+          2. It polls for a response (default 30 min timeout)
+          3. If someone responds, you get their answer and can continue
+          4. If no response, the workflow pauses and will auto-resume when someone replies
+
+          **When calling:**
+          - Be specific about what you need and why
+          - Provide context about what you're trying to accomplish
+          - Ask one clear question at a time
+          CLARIFICATION_EOF
+
+          # If this is a resumed run, inject the clarification response
+          if [ "${{ inputs.is_resume }}" == "true" ] && [ -n "${{ inputs.clarification_response }}" ]; then
+            cat << 'RESUME_EOF' >> /tmp/system_prompt.txt
+
+          ## IMPORTANT: Clarification Response Available
+
+          This is a RESUMED run. You previously asked for clarification and the team has responded.
+          Their response is provided below. Use this information to continue your work.
+
+          RESUME_EOF
+
+            # Use environment variable to safely handle the response content
+            echo "### Human Response:" >> /tmp/system_prompt.txt
+            echo "" >> /tmp/system_prompt.txt
+            echo "$CLARIFICATION_RESPONSE_TEXT" >> /tmp/system_prompt.txt
+            echo "" >> /tmp/system_prompt.txt
+            echo "---" >> /tmp/system_prompt.txt
+            echo "" >> /tmp/system_prompt.txt
+            echo "Continue your work using this information. Do NOT ask for clarification again on the same topic." >> /tmp/system_prompt.txt
+          fi
 
       - name: Write agent output schema (file)
         id: schema # <--- Add ID
@@ -715,6 +810,75 @@ jobs:
             sleep "$SLEEP_TIME"
           done
 
+      - name: Check for clarification checkpoint
+        id: checkpoint
+        if: always()
+        shell: bash {0}
+        run: |
+          # Look for any checkpoint files created by the clarification MCP tool
+          # Note: using bash {0} to avoid -e flag causing early exit
+          CHECKPOINT_FILE=$(find /tmp -name "clarification-checkpoint-*.json" -type f 2>/dev/null | head -1 || echo "")
+          if [ -n "$CHECKPOINT_FILE" ] && [ -f "$CHECKPOINT_FILE" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "path=$CHECKPOINT_FILE" >> "$GITHUB_OUTPUT"
+            CHECKPOINT_ID=$(basename "$CHECKPOINT_FILE" .json | sed 's/clarification-checkpoint-//')
+            echo "id=$CHECKPOINT_ID" >> "$GITHUB_OUTPUT"
+            echo "Found clarification checkpoint: $CHECKPOINT_FILE"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No clarification checkpoint found"
+          fi
+
+      - name: Enrich checkpoint with orchestrator state
+        if: always() && steps.checkpoint.outputs.found == 'true'
+        shell: bash
+        env:
+          ORCHESTRATOR_STATE: |
+            {
+              "activate_documentation_sheriff": "${{ inputs.activate_documentation_sheriff || 'false' }}",
+              "activate_infrastructure_engineer": "${{ inputs.activate_infrastructure_engineer || 'false' }}",
+              "activate_product_owner": "${{ inputs.activate_product_owner || 'false' }}",
+              "activate_project_manager": "${{ inputs.activate_project_manager || 'false' }}",
+              "activate_security_engineer": "${{ inputs.activate_security_engineer || 'false' }}",
+              "activate_software_engineer": "${{ inputs.activate_software_engineer || 'false' }}",
+              "activate_tech_lead": "${{ inputs.activate_tech_lead || 'false' }}",
+              "activate_test_engineer": "${{ inputs.activate_test_engineer || 'false' }}",
+              "activate_ux_designer": "${{ inputs.activate_ux_designer || 'false' }}",
+              "issue_context": ${{ toJSON(inputs.issue_context) }},
+              "agent_prompts": ${{ toJSON(inputs.agent_prompts) }},
+              "work_branch": "${{ inputs.work_branch }}",
+              "is_hotfix": "false"
+            }
+        run: |
+          set -euo pipefail
+          CHECKPOINT_FILE="${{ steps.checkpoint.outputs.path }}"
+
+          # Add orchestrator state and planning context to checkpoint
+          jq --argjson orch_state "$ORCHESTRATOR_STATE" \
+             --arg planning_context "${{ inputs.planning_context }}" \
+             --arg issue_number "${{ inputs.issue_number }}" \
+             '. + {
+               orchestrator_state: $orch_state,
+               resume_point: {
+                 agent: .clarification.requesting_agent,
+                 phase: .clarification.requesting_phase,
+                 planning_context: $planning_context
+               },
+               issue: (.issue + { number: ($issue_number | tonumber) })
+             }' "$CHECKPOINT_FILE" > /tmp/enriched-checkpoint.json
+
+          mv /tmp/enriched-checkpoint.json "$CHECKPOINT_FILE"
+          echo "Enriched checkpoint with orchestrator state"
+          cat "$CHECKPOINT_FILE" | jq .
+
+      - name: Upload clarification checkpoint artifact
+        if: always() && steps.checkpoint.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: clarification-checkpoint-${{ steps.checkpoint.outputs.id }}
+          path: ${{ steps.checkpoint.outputs.path }}
+          retention-days: 30
+
       - name: Parse agent output (defensive)
         id: parse
         if: always()
@@ -757,6 +921,7 @@ jobs:
 
       # Submit PR review to GitHub (code-reviewer only)
       # This converts the agent's JSON output into an actual GitHub PR review
+      # Uses PR_REVIEW_PAT (different user than PR author) so auto-merge works correctly
       - name: Submit PR review (code-reviewer only)
         if: |
           always() &&
@@ -765,7 +930,7 @@ jobs:
           steps.parse.outputs.has_result == 'true'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          github-token: ${{ secrets.PR_REVIEW_PAT }}
           script: |
             // Defensive parsing pattern - matches orchestrator and parse step
             const resultJson = (process.env.AGENT_RESULT || '').trim();

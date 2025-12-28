@@ -429,10 +429,15 @@ export async function createFile(
  * @returns Buffer containing the file content
  */
 export async function downloadAttachment(url: string): Promise<Buffer> {
-  const response = await fetch(url);
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; DiscordBot/1.0)',
+      'Accept': 'image/*,*/*',
+    },
+  });
 
   if (!response.ok) {
-    throw new Error(`Failed to download attachment: ${response.status} ${response.statusText}`);
+    throw new Error(`Failed to download attachment: ${response.status} ${response.statusText} (URL: ${url.substring(0, 100)}...)`);
   }
 
   const arrayBuffer = await response.arrayBuffer();

@@ -272,12 +272,14 @@ export async function executeToolCall(
             discordDevWebhookUrl: args.discordDevWebhookUrl as string | undefined,
             discordProductWebhookUrl: args.discordProductWebhookUrl as string | undefined,
             openaiApiKey: args.openaiApiKey as string | undefined,
+            discordE2eWebhookUrl: args.discordE2eWebhookUrl as string | undefined,
           },
           {
             discordProductChannelId: args.discordProductChannelId as string | undefined,
             discordDevChannelId: args.discordDevChannelId as string | undefined,
             discordPrChannelId: args.discordPrChannelId as string | undefined,
             discordTeamLeadUserId: args.discordTeamLeadUserId as string | undefined,
+            appPublicDomain: args.appPublicDomain as string | undefined,
           },
           false
         );
@@ -288,6 +290,15 @@ export async function executeToolCall(
 
         return result;
       }
+
+      case 'github_scaffold_repo_config':
+        return await githubSecrets.scaffoldRepoFromTemplate(
+          args.projectId as string,
+          (args.secretValues as Record<string, string>) ?? {}
+        );
+
+      case 'github_get_template_config':
+        return await githubSecrets.getTemplateConfig();
 
       case 'discord_list_servers':
         return await discordServers.listServers();
@@ -339,6 +350,16 @@ export async function executeToolCall(
             categoryId: args.categoryId as string | undefined,
           }
         );
+
+      case 'discord_create_webhook':
+        return await discordServers.createWebhook(
+          args.serverId as string,
+          args.channelName as string,
+          args.webhookName as string | undefined
+        );
+
+      case 'discord_get_channel_ids':
+        return await discordServers.getChannelIds(args.serverId as string);
 
       case 'discord_create_thread': {
         const channel = context.channel;
@@ -1017,12 +1038,16 @@ export async function executeApprovedTool(
           discordDevWebhookUrl: args.discordDevWebhookUrl as string | undefined,
           discordProductWebhookUrl: args.discordProductWebhookUrl as string | undefined,
           openaiApiKey: args.openaiApiKey as string | undefined,
+          // E2E Testing
+          discordE2eWebhookUrl: args.discordE2eWebhookUrl as string | undefined,
         },
         {
           discordProductChannelId: args.discordProductChannelId as string | undefined,
           discordDevChannelId: args.discordDevChannelId as string | undefined,
           discordPrChannelId: args.discordPrChannelId as string | undefined,
           discordTeamLeadUserId: args.discordTeamLeadUserId as string | undefined,
+          // E2E Testing
+          appPublicDomain: args.appPublicDomain as string | undefined,
         },
         true
       );

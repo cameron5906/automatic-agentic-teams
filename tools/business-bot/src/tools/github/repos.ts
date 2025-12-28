@@ -2,6 +2,7 @@ import type { ToolResult } from '../../types';
 import * as github from '../../services/github';
 import * as projectStore from '../../context/project-store';
 import { config } from '../../config';
+import { scaffoldRepoFromTemplate } from './secrets';
 
 export async function listRepos(org?: string): Promise<ToolResult> {
   try {
@@ -159,6 +160,13 @@ export async function createRepoFromTemplate(
       isPrivate: options.isPrivate ?? true,
     });
 
+    const scaffoldResult = await scaffoldRepoFromTemplate(projectId, {});
+
+    const scaffoldData = scaffoldResult.data as {
+      variablesSet?: string[];
+      missingSecrets?: string[];
+    } | undefined;
+
     return {
       success: true,
       data: {
@@ -167,7 +175,18 @@ export async function createRepoFromTemplate(
         url: repo.url,
         cloneUrl: repo.cloneUrl,
         createdFromTemplate: repo.createdFromTemplate,
-        message: `Created repository ${repo.fullName} from template ${repo.createdFromTemplate}`,
+        scaffolding: {
+          variablesCopied: scaffoldData?.variablesSet ?? [],
+          missingSecrets: scaffoldData?.missingSecrets ?? [],
+        },
+        message:
+          `Created repository ${repo.fullName} from template ${repo.createdFromTemplate}. ` +
+          (scaffoldData?.variablesSet?.length
+            ? `Copied ${scaffoldData.variablesSet.length} variables from template. `
+            : '') +
+          (scaffoldData?.missingSecrets?.length
+            ? `The following secrets need to be configured: ${scaffoldData.missingSecrets.join(', ')}`
+            : 'All configuration complete.'),
       },
     };
   } catch (error) {

@@ -428,8 +428,55 @@ export const githubTools: ChatCompletionTool[] = [
             type: 'string',
             description: 'Discord user ID to ping for approvals',
           },
+          discordE2eWebhookUrl: {
+            type: 'string',
+            description: 'Discord webhook URL for E2E test result notifications',
+          },
+          appPublicDomain: {
+            type: 'string',
+            description: 'Public URL of the deployed application for E2E testing (e.g., https://myapp.com)',
+          },
         },
         required: ['projectId', 'anthropicApiKey', 'claudeWorkflowToken'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_scaffold_repo_config',
+      description:
+        'Scaffold repository secrets and variables by discovering them from the template repo. ' +
+        'Variables are copied directly from the template. Secrets require user-provided values. ' +
+        'This is automatically called after creating a repo from template.',
+      parameters: {
+        type: 'object',
+        properties: {
+          projectId: {
+            type: 'string',
+            description: 'Project ID (must have a GitHub repo configured)',
+          },
+          secretValues: {
+            type: 'object',
+            description: 'Key-value pairs of secret names and their values',
+            additionalProperties: { type: 'string' },
+          },
+        },
+        required: ['projectId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_get_template_config',
+      description:
+        'Get the list of secrets and variables configured on the template repository. ' +
+        'Use this to see what configuration is needed before scaffolding.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
       },
     },
   },

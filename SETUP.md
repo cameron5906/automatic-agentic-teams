@@ -663,8 +663,9 @@ Always output a JSON summary:
 | Secret | Used By | Description |
 |--------|---------|-------------|
 | `DISCORD_PRODUCT_WEBHOOK_URL` | issue-discord-relay | Discord webhook URL for #product channel updates |
-| `OPENAI_API_KEY` | issue-discord-relay, discord-product-bot | Required for issue relay and Discord bot intelligence |
+| `OPENAI_API_KEY` | issue-discord-relay, discord-product-bot, e2e-skyvern | Required for issue relay, Discord bot, and E2E test analysis |
 | `AWS_ROLE_ARN` | deploy-discord-bot | IAM role ARN for GitHub Actions OIDC |
+| `DISCORD_E2E_WEBHOOK_URL` | e2e-skyvern | Discord webhook URL for E2E test result notifications |
 
 ### Discord Bot Configuration
 
@@ -691,6 +692,35 @@ These **must** be configured as GitHub Variables for the bot to know which chann
 
 Go to **Settings → Secrets and variables → Actions → Variables** to add these.
 
+### E2E Testing Configuration (Optional)
+
+For automated browser testing with self-hosted Skyvern on AWS Fargate:
+
+#### Per-Project Variables
+
+| Variable | Description |
+|----------|-------------|
+| `APP_PUBLIC_DOMAIN` | Public URL of the deployed application for E2E testing |
+
+#### Shared Infrastructure Variables (Set at org level or copy from deploy script output)
+
+| Variable | Description |
+|----------|-------------|
+| `AWS_REGION` | AWS region for Skyvern (default: us-east-2) |
+| `SKYVERN_CLUSTER` | ECS cluster name |
+| `SKYVERN_TASK_DEF` | Task definition ARN |
+| `SKYVERN_TASK_ROLE_ARN` | IAM role ARN for GitHub OIDC |
+| `SKYVERN_SUBNETS` | Comma-separated subnet IDs |
+| `SKYVERN_SECURITY_GROUP` | Security group ID |
+| `SKYVERN_ARTIFACTS_BUCKET` | S3 bucket for test results |
+
+To deploy the Skyvern infrastructure, run:
+```powershell
+.\scripts\deploy-skyvern.ps1 -Profile "your-aws-profile" -GithubOrg "your-org"
+```
+
+See [docs/automation/e2e-testing.md](./docs/automation/e2e-testing.md) for full documentation.
+
 ### Finding Discord Channel/User IDs
 
 1. Enable Developer Mode in Discord: **User Settings → App Settings → Advanced → Developer Mode**
@@ -707,9 +737,11 @@ After completing setup:
 3. **Review DEVLOG.md**: Check session summaries after pipeline runs
 4. **Tune the orchestrator**: Adjust which agents activate for different issue types
 5. **Set up Discord bot** (optional): Run `.\scripts\deploy-bot.ps1 -Action setup -Profile YOUR_PROFILE`
+6. **Set up E2E testing** (optional): Run `.\scripts\deploy-skyvern.ps1 -Profile YOUR_PROFILE -GithubOrg YOUR_ORG`
 
 For more information, see:
 - [CLAUDE.md](./CLAUDE.md) - Project-specific instructions
 - [ABOUT.md](./ABOUT.md) - Product information and milestones
 - [tools/discord-product-bot/README.md](./tools/discord-product-bot/README.md) - Discord bot details
 - [tools/mcp-discord/README.md](./tools/mcp-discord/README.md) - MCP server details
+- [docs/automation/e2e-testing.md](./docs/automation/e2e-testing.md) - E2E testing with Skyvern

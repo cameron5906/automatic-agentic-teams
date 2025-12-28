@@ -12,6 +12,7 @@ import {
   commitAttachment,
   type AttachmentCommitResult,
 } from '../services/github.js';
+import { uploadAttachment, isS3Enabled } from '../services/s3-attachments.js';
 import { trackIssue } from '../services/issue-tracker.js';
 import type {
   SearchResult,
@@ -115,18 +116,35 @@ export async function repo_get_deployment_status(
 }
 
 /**
- * Commits a file attachment (e.g., Discord image) to the repository.
- * Downloads the file from the provided URL and creates it in the repo.
- * Returns a permanent URL that can be used in GitHub issues/PRs.
- * 
+ * Uploads a file attachment (e.g., Discord image) for permanent storage.
+ *
+ * If S3 is configured (S3_ATTACHMENTS_BUCKET env var), uploads to S3 for immediate
+ * availability. Otherwise falls back to committing to the GitHub repository.
+ *
+ * S3 is preferred because:
+ * - Immediate availability (no CDN cache delay)
+ * - Works for both public and private repos
+ * - No authentication required for viewing
+ *
  * @param attachmentUrl - The URL to download the attachment from (e.g., Discord CDN)
- * @param targetPath - Path in the repo where the file should be stored
- * @param commitMessage - Commit message describing the file
+ * @param targetPath - Path/name for the file (used for naming in S3 or repo path)
+ * @param commitMessage - Commit message (only used for GitHub fallback)
  */
 export async function repo_commit_attachment(
   attachmentUrl: string,
   targetPath: string,
   commitMessage: string
 ): Promise<AttachmentCommitResult> {
+  if (isS3Enabled()) {
+    const filename = targetPath.split('/').pop() || 'attachment';
+    const result = await uploadAttachment(attachmentUrl, filename);
+    return {
+      path: result.key,
+      sha: '',
+      commitUrl: '',
+      permanentUrl: result.publicUrl,
+    };
+  }
+
   return await commitAttachment(attachmentUrl, targetPath, commitMessage);
 }

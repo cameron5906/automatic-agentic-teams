@@ -9,9 +9,36 @@ on:
         description: "Issue number to process"
         required: true
         type: number
-
-env:
-  TEMPLATE_REPO_NAME: automatic-agentic-teams
+      # Resume mode inputs (for clarification response handling)
+      resume_mode:
+        description: "Whether this is a resume from clarification timeout"
+        required: false
+        type: boolean
+        default: false
+      resume_checkpoint_id:
+        description: "Checkpoint ID for resume"
+        required: false
+        type: string
+      clarification_response:
+        description: "The clarification response from human"
+        required: false
+        type: string
+      orchestrator_state:
+        description: "JSON string of orchestrator outputs (for resume)"
+        required: false
+        type: string
+      resume_from_agent:
+        description: "Agent to resume from"
+        required: false
+        type: string
+      resume_from_phase:
+        description: "Phase to resume from"
+        required: false
+        type: string
+      resume_planning_context:
+        description: "Planning context for resumed agent"
+        required: false
+        type: string
 
 concurrency:
   group: issue-pipeline-global
@@ -26,12 +53,16 @@ env:
   AGENTS_DEFINITIONS_PATH: working/agents/definitions
   AGENTS_MEMORY_PATH: working/agents/memory
   ISSUES_PATH: working/issues
+  TEMPLATE_REPO_NAME: automatic-agentic-teams
 
 jobs:
   orchestrate:
     name: Orchestrate Pipeline
     runs-on: ubuntu-latest
-    if: github.event.repository.name != 'automatic-agentic-teams'
+    # Skip orchestrator in resume mode - use provided state instead
+    if: |
+      github.event.repository.name != 'automatic-agentic-teams' &&
+      inputs.resume_mode != true
     outputs:
       delegation: ${{ steps.parse.outputs.delegation }}
       activate_documentation_sheriff: ${{ steps.parse.outputs.activate_documentation_sheriff }}
@@ -105,84 +136,6 @@ jobs:
             echo "is_hotfix=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Ensure docs directories exist
-        run: |
-          # Stage any new docs files
-          mkdir -p docs/adr docs/research
-          git add docs/ || true
-
-<<<<<<< Updated upstream
-      - name: Seed issue context file
-        id: seed
-        run: |
-          mkdir -p ${{ env.ISSUES_PATH }}
-          ISSUE_FILE="${{ env.ISSUES_PATH }}/${{ steps.issue.outputs.number }} ${{ steps.issue.outputs.title }}.md"
-          ISSUE_FILE=$(echo "$ISSUE_FILE" | sed 's/[<>:"|?*]/_/g')
-
-          cat << 'EOF' > "$ISSUE_FILE"
-          # Issue #${{ steps.issue.outputs.number }}: ${{ steps.issue.outputs.title }}
-
-          **Author:** ${{ steps.issue.outputs.author }}
-          **Created:** ${{ steps.issue.outputs.created_at }}
-          **Labels:** ${{ steps.issue.outputs.labels }}
-
-          ## Original Description
-
-          ${{ steps.issue.outputs.body }}
-
-          ---
-
-          ## Pre-Planning Context
-
-          _This section will be populated by pre-work agents._
-
-          ### Documentation Context
-          _Pending documentation-sheriff (pre)_
-
-          ### Infrastructure Context
-          _Pending infrastructure-engineer (pre)_
-
-          ### Security Context
-          _Pending security-engineer (pre)_
-
-          ---
-
-          ## Planning Decisions
-
-          _This section will be populated by planning agents._
-
-          ### Product Requirements
-          _Pending product-owner_
-
-          ### UX Design Notes
-          _Pending ux-designer_
-
-          ### Technical Approach
-          _Pending tech-lead_
-
-          ---
-
-          ## Implementation Notes
-
-          _This section will be populated during development._
-
-          ---
-
-          ## Post-Work Validation
-
-          _This section will be populated by post-work agents._
-
-          EOF
-
-          git add "$ISSUE_FILE"
-          git add docs/ || true
-          git commit -m "chore: seed issue context and docs for #${{ steps.issue.outputs.number }}"
-          git push
-
-          echo "issue_file=$ISSUE_FILE" >> $GITHUB_OUTPUT
-
-=======
->>>>>>> Stashed changes
       - name: Load agent definitions
         id: definitions
         run: |
@@ -191,9 +144,15 @@ jobs:
             AGENTS_JSON=$(find ${{ env.AGENTS_DEFINITIONS_PATH }} -name "*.md" -type f | while read file; do
               name=$(basename "$file" .md)
               echo "{\"name\": \"$name\", \"path\": \"$file\"}"
-            done | jq -s '.')
+            done | jq -sc '.')
           fi
-          echo "agents=$AGENTS_JSON" >> $GITHUB_OUTPUT
+          # Use heredoc format for JSON output
+          DELIM="EOF_$(openssl rand -hex 8)"
+          {
+            echo "agents<<$DELIM"
+            echo "$AGENTS_JSON"
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -362,9 +321,16 @@ jobs:
           echo "$ORCH_TEXT" | jq -e . > /tmp/orchestrator.json
           ORCH_COMPACT="$(cat /tmp/orchestrator.json | jq -c .)"
 
-          # Emit outputs compatible with your existing parse step
-          echo "structured_output=${ORCH_COMPACT}" >> "$GITHUB_OUTPUT"
-          echo "result=${ORCH_COMPACT}" >> "$GITHUB_OUTPUT"
+          # Emit outputs using heredoc format (handles special chars in JSON)
+          DELIM="EOF_$(openssl rand -hex 8)"
+          {
+            echo "structured_output<<$DELIM"
+            echo "$ORCH_COMPACT"
+            echo "$DELIM"
+            echo "result<<$DELIM"
+            echo "$ORCH_COMPACT"
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Parse orchestrator output
         id: parse
@@ -448,21 +414,62 @@ jobs:
           SANITIZED_TITLE="$(echo "${{ steps.issue.outputs.title }}" | sed 's/[<>:"|?*\/\\]/_/g')"
           ISSUE_FILE="working/issues/${{ steps.issue.outputs.number }} ${SANITIZED_TITLE}.md"
 
+          mkdir -p docs/adr docs/research
+
           if [ ! -f "$ISSUE_FILE" ]; then
             cat << EOF > "$ISSUE_FILE"
-          # Issue ${{ steps.issue.outputs.number }}: ${{ steps.issue.outputs.title }}
+          # Issue #${{ steps.issue.outputs.number }}: ${{ steps.issue.outputs.title }}
 
-          ** Author:** ${{ steps.issue.outputs.author }}
-          ** Created:** ${{ steps.issue.outputs.created_at }}
-          ** Labels:** ${{ steps.issue.outputs.labels }}
+          **Author:** ${{ steps.issue.outputs.author }}
+          **Created:** ${{ steps.issue.outputs.created_at }}
+          **Labels:** ${{ steps.issue.outputs.labels }}
 
-          # Original Description
+          ## Original Description
+
           ${{ steps.issue.outputs.body }}
 
+          ---
+
+          ## Pre-Planning Context
+
+          _This section will be populated by pre-work agents._
+
+          ### Documentation Context
+          _Pending documentation-sheriff (pre)_
+
+          ### Infrastructure Context
+          _Pending infrastructure-engineer (pre)_
+
+          ### Security Context
+          _Pending security-engineer (pre)_
 
           ---
-          ## Pipeline Context
-          _Populated by agents._
+
+          ## Planning Decisions
+
+          _This section will be populated by planning agents._
+
+          ### Product Requirements
+          _Pending product-owner_
+
+          ### UX Design Notes
+          _Pending ux-designer_
+
+          ### Technical Approach
+          _Pending tech-lead_
+
+          ---
+
+          ## Implementation Notes
+
+          _This section will be populated during development._
+
+          ---
+
+          ## Post-Work Validation
+
+          _This section will be populated by post-work agents._
+
           EOF
           fi
 
@@ -523,22 +530,297 @@ jobs:
           retention-days: 1
 
   # ============================================================================
+  # RESUME MODE: Inject orchestrator state from checkpoint
+  # ============================================================================
+  resume-orchestrate:
+    name: Resume Orchestrator State
+    runs-on: ubuntu-latest
+    if: inputs.resume_mode == true
+    outputs:
+      delegation: ${{ steps.inject.outputs.delegation }}
+      activate_documentation_sheriff: ${{ steps.inject.outputs.activate_documentation_sheriff }}
+      activate_infrastructure_engineer: ${{ steps.inject.outputs.activate_infrastructure_engineer }}
+      activate_product_owner: ${{ steps.inject.outputs.activate_product_owner }}
+      activate_project_manager: ${{ steps.inject.outputs.activate_project_manager }}
+      activate_security_engineer: ${{ steps.inject.outputs.activate_security_engineer }}
+      activate_software_engineer: ${{ steps.inject.outputs.activate_software_engineer }}
+      activate_tech_lead: ${{ steps.inject.outputs.activate_tech_lead }}
+      activate_test_engineer: ${{ steps.inject.outputs.activate_test_engineer }}
+      activate_ux_designer: ${{ steps.inject.outputs.activate_ux_designer }}
+      issue_context: ${{ steps.inject.outputs.issue_context }}
+      agent_prompts: ${{ steps.inject.outputs.agent_prompts }}
+      issue_number: ${{ inputs.issue_number }}
+      issue_file: ${{ steps.inject.outputs.issue_file }}
+      work_branch: ${{ steps.inject.outputs.work_branch }}
+      is_hotfix: ${{ steps.inject.outputs.is_hotfix }}
+      # Resume-specific outputs
+      resume_from_agent: ${{ inputs.resume_from_agent }}
+      resume_from_phase: ${{ inputs.resume_from_phase }}
+      clarification_response: ${{ inputs.clarification_response }}
+      resume_planning_context: ${{ inputs.resume_planning_context }}
+    steps:
+      - name: Inject orchestrator state from inputs
+        id: inject
+        uses: actions/github-script@v7
+        env:
+          ORCHESTRATOR_STATE: ${{ inputs.orchestrator_state }}
+        with:
+          script: |
+            const stateJson = process.env.ORCHESTRATOR_STATE || '{}';
+            let state;
+            try {
+              state = JSON.parse(stateJson);
+            } catch (e) {
+              core.setFailed(`Failed to parse orchestrator_state: ${e.message}`);
+              return;
+            }
+
+            // Output all the orchestrator state fields
+            core.setOutput('activate_documentation_sheriff', state.activate_documentation_sheriff || 'false');
+            core.setOutput('activate_infrastructure_engineer', state.activate_infrastructure_engineer || 'false');
+            core.setOutput('activate_product_owner', state.activate_product_owner || 'false');
+            core.setOutput('activate_project_manager', state.activate_project_manager || 'false');
+            core.setOutput('activate_security_engineer', state.activate_security_engineer || 'false');
+            core.setOutput('activate_software_engineer', state.activate_software_engineer || 'false');
+            core.setOutput('activate_tech_lead', state.activate_tech_lead || 'false');
+            core.setOutput('activate_test_engineer', state.activate_test_engineer || 'false');
+            core.setOutput('activate_ux_designer', state.activate_ux_designer || 'false');
+            core.setOutput('issue_context', state.issue_context || '');
+            core.setOutput('agent_prompts', state.agent_prompts || '{}');
+            core.setOutput('work_branch', state.work_branch || '');
+            core.setOutput('issue_file', state.issue_file || '');
+            core.setOutput('is_hotfix', state.is_hotfix || 'false');
+            core.setOutput('delegation', state.delegation || '{}');
+
+            console.log('Injected orchestrator state for resume mode');
+            console.log(`Resume from: ${{ inputs.resume_from_agent }} (${{ inputs.resume_from_phase }})`);
+
+      - name: Post resume notification
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = ${{ inputs.issue_number }};
+            const agent = '${{ inputs.resume_from_agent }}';
+            const phase = '${{ inputs.resume_from_phase }}';
+            const checkpointId = '${{ inputs.resume_checkpoint_id }}';
+
+            const body = [
+              '## Pipeline Resumed',
+              '',
+              `The pipeline is resuming from the **${agent}** agent (${phase} phase) with your clarification response.`,
+              '',
+              `<!-- RESUME_CHECKPOINT: ${checkpointId} -->`
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body
+            });
+
+  # ============================================================================
+  # CONSOLIDATED ORCHESTRATOR OUTPUT
+  # This job consolidates outputs from either orchestrate or resume-orchestrate
+  # All downstream jobs depend on this instead of directly on orchestrate
+  # ============================================================================
+  pipeline-config:
+    name: Pipeline Configuration
+    runs-on: ubuntu-latest
+    needs: [orchestrate, resume-orchestrate]
+    if: always() && (needs.orchestrate.result == 'success' || needs.resume-orchestrate.result == 'success')
+    outputs:
+      delegation: ${{ steps.consolidate.outputs.delegation }}
+      activate_documentation_sheriff: ${{ steps.consolidate.outputs.activate_documentation_sheriff }}
+      activate_infrastructure_engineer: ${{ steps.consolidate.outputs.activate_infrastructure_engineer }}
+      activate_product_owner: ${{ steps.consolidate.outputs.activate_product_owner }}
+      activate_project_manager: ${{ steps.consolidate.outputs.activate_project_manager }}
+      activate_security_engineer: ${{ steps.consolidate.outputs.activate_security_engineer }}
+      activate_software_engineer: ${{ steps.consolidate.outputs.activate_software_engineer }}
+      activate_tech_lead: ${{ steps.consolidate.outputs.activate_tech_lead }}
+      activate_test_engineer: ${{ steps.consolidate.outputs.activate_test_engineer }}
+      activate_ux_designer: ${{ steps.consolidate.outputs.activate_ux_designer }}
+      issue_context: ${{ steps.consolidate.outputs.issue_context }}
+      agent_prompts: ${{ steps.consolidate.outputs.agent_prompts }}
+      issue_number: ${{ steps.consolidate.outputs.issue_number }}
+      issue_file: ${{ steps.consolidate.outputs.issue_file }}
+      work_branch: ${{ steps.consolidate.outputs.work_branch }}
+      is_hotfix: ${{ steps.consolidate.outputs.is_hotfix }}
+      # Resume mode specific
+      is_resume: ${{ steps.consolidate.outputs.is_resume }}
+      resume_from_agent: ${{ steps.consolidate.outputs.resume_from_agent }}
+      resume_from_phase: ${{ steps.consolidate.outputs.resume_from_phase }}
+      clarification_response: ${{ steps.consolidate.outputs.clarification_response }}
+      resume_planning_context: ${{ steps.consolidate.outputs.resume_planning_context }}
+      # Resume skip flags - true means skip this agent (already ran before checkpoint)
+      skip_pre_documentation: ${{ steps.resume_skip.outputs.skip_pre_documentation }}
+      skip_pre_infrastructure: ${{ steps.resume_skip.outputs.skip_pre_infrastructure }}
+      skip_pre_security: ${{ steps.resume_skip.outputs.skip_pre_security }}
+      skip_planning_product: ${{ steps.resume_skip.outputs.skip_planning_product }}
+      skip_planning_ux: ${{ steps.resume_skip.outputs.skip_planning_ux }}
+      skip_planning_tech_lead: ${{ steps.resume_skip.outputs.skip_planning_tech_lead }}
+      skip_development_software: ${{ steps.resume_skip.outputs.skip_development_software }}
+      skip_development_infrastructure: ${{ steps.resume_skip.outputs.skip_development_infrastructure }}
+      skip_post_test: ${{ steps.resume_skip.outputs.skip_post_test }}
+      skip_post_security: ${{ steps.resume_skip.outputs.skip_post_security }}
+      skip_post_documentation: ${{ steps.resume_skip.outputs.skip_post_documentation }}
+      skip_project_manager: ${{ steps.resume_skip.outputs.skip_project_manager }}
+      skip_code_review: ${{ steps.resume_skip.outputs.skip_code_review }}
+    steps:
+      - name: Consolidate orchestrator outputs
+        id: consolidate
+        shell: bash
+        run: |
+          # Determine which source to use
+          if [ "${{ needs.resume-orchestrate.result }}" == "success" ]; then
+            echo "Using resume-orchestrate outputs"
+            echo "is_resume=true" >> "$GITHUB_OUTPUT"
+
+            # Resume mode outputs
+            echo "delegation=${{ needs.resume-orchestrate.outputs.delegation }}" >> "$GITHUB_OUTPUT"
+            echo "activate_documentation_sheriff=${{ needs.resume-orchestrate.outputs.activate_documentation_sheriff }}" >> "$GITHUB_OUTPUT"
+            echo "activate_infrastructure_engineer=${{ needs.resume-orchestrate.outputs.activate_infrastructure_engineer }}" >> "$GITHUB_OUTPUT"
+            echo "activate_product_owner=${{ needs.resume-orchestrate.outputs.activate_product_owner }}" >> "$GITHUB_OUTPUT"
+            echo "activate_project_manager=${{ needs.resume-orchestrate.outputs.activate_project_manager }}" >> "$GITHUB_OUTPUT"
+            echo "activate_security_engineer=${{ needs.resume-orchestrate.outputs.activate_security_engineer }}" >> "$GITHUB_OUTPUT"
+            echo "activate_software_engineer=${{ needs.resume-orchestrate.outputs.activate_software_engineer }}" >> "$GITHUB_OUTPUT"
+            echo "activate_tech_lead=${{ needs.resume-orchestrate.outputs.activate_tech_lead }}" >> "$GITHUB_OUTPUT"
+            echo "activate_test_engineer=${{ needs.resume-orchestrate.outputs.activate_test_engineer }}" >> "$GITHUB_OUTPUT"
+            echo "activate_ux_designer=${{ needs.resume-orchestrate.outputs.activate_ux_designer }}" >> "$GITHUB_OUTPUT"
+            echo "issue_context=${{ needs.resume-orchestrate.outputs.issue_context }}" >> "$GITHUB_OUTPUT"
+            echo "agent_prompts=${{ needs.resume-orchestrate.outputs.agent_prompts }}" >> "$GITHUB_OUTPUT"
+            echo "issue_number=${{ needs.resume-orchestrate.outputs.issue_number }}" >> "$GITHUB_OUTPUT"
+            echo "issue_file=${{ needs.resume-orchestrate.outputs.issue_file }}" >> "$GITHUB_OUTPUT"
+            echo "work_branch=${{ needs.resume-orchestrate.outputs.work_branch }}" >> "$GITHUB_OUTPUT"
+            echo "is_hotfix=${{ needs.resume-orchestrate.outputs.is_hotfix }}" >> "$GITHUB_OUTPUT"
+            echo "resume_from_agent=${{ needs.resume-orchestrate.outputs.resume_from_agent }}" >> "$GITHUB_OUTPUT"
+            echo "resume_from_phase=${{ needs.resume-orchestrate.outputs.resume_from_phase }}" >> "$GITHUB_OUTPUT"
+            echo "clarification_response=${{ needs.resume-orchestrate.outputs.clarification_response }}" >> "$GITHUB_OUTPUT"
+            echo "resume_planning_context=${{ needs.resume-orchestrate.outputs.resume_planning_context }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Using orchestrate outputs"
+            echo "is_resume=false" >> "$GITHUB_OUTPUT"
+
+            # Normal mode outputs
+            echo "delegation=${{ needs.orchestrate.outputs.delegation }}" >> "$GITHUB_OUTPUT"
+            echo "activate_documentation_sheriff=${{ needs.orchestrate.outputs.activate_documentation_sheriff }}" >> "$GITHUB_OUTPUT"
+            echo "activate_infrastructure_engineer=${{ needs.orchestrate.outputs.activate_infrastructure_engineer }}" >> "$GITHUB_OUTPUT"
+            echo "activate_product_owner=${{ needs.orchestrate.outputs.activate_product_owner }}" >> "$GITHUB_OUTPUT"
+            echo "activate_project_manager=${{ needs.orchestrate.outputs.activate_project_manager }}" >> "$GITHUB_OUTPUT"
+            echo "activate_security_engineer=${{ needs.orchestrate.outputs.activate_security_engineer }}" >> "$GITHUB_OUTPUT"
+            echo "activate_software_engineer=${{ needs.orchestrate.outputs.activate_software_engineer }}" >> "$GITHUB_OUTPUT"
+            echo "activate_tech_lead=${{ needs.orchestrate.outputs.activate_tech_lead }}" >> "$GITHUB_OUTPUT"
+            echo "activate_test_engineer=${{ needs.orchestrate.outputs.activate_test_engineer }}" >> "$GITHUB_OUTPUT"
+            echo "activate_ux_designer=${{ needs.orchestrate.outputs.activate_ux_designer }}" >> "$GITHUB_OUTPUT"
+            echo "issue_context=${{ needs.orchestrate.outputs.issue_context }}" >> "$GITHUB_OUTPUT"
+            echo "agent_prompts=${{ needs.orchestrate.outputs.agent_prompts }}" >> "$GITHUB_OUTPUT"
+            echo "issue_number=${{ needs.orchestrate.outputs.issue_number }}" >> "$GITHUB_OUTPUT"
+            echo "issue_file=${{ needs.orchestrate.outputs.issue_file }}" >> "$GITHUB_OUTPUT"
+            echo "work_branch=${{ needs.orchestrate.outputs.work_branch }}" >> "$GITHUB_OUTPUT"
+            echo "is_hotfix=${{ needs.orchestrate.outputs.is_hotfix }}" >> "$GITHUB_OUTPUT"
+            echo "resume_from_agent=" >> "$GITHUB_OUTPUT"
+            echo "resume_from_phase=" >> "$GITHUB_OUTPUT"
+            echo "clarification_response=" >> "$GITHUB_OUTPUT"
+            echo "resume_planning_context=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Calculate resume skip flags
+        id: resume_skip
+        shell: bash
+        run: |
+          # Pipeline order (index determines if agent should be skipped in resume mode)
+          # Agents with index < resume_index should be skipped (already ran)
+          # Agents with index >= resume_index should run (resume point and after)
+          declare -A AGENT_ORDER=(
+            ["documentation-sheriff:pre"]=1
+            ["infrastructure-engineer:pre"]=2
+            ["security-engineer:pre"]=3
+            ["product-owner:main"]=4
+            ["ux-designer:main"]=5
+            ["tech-lead:main"]=6
+            ["software-engineer:main"]=7
+            ["infrastructure-engineer:main"]=8
+            ["test-engineer:post"]=9
+            ["security-engineer:post"]=10
+            ["documentation-sheriff:post"]=11
+            ["project-manager:post"]=12
+            ["code-reviewer:review"]=13
+          )
+
+          IS_RESUME="${{ steps.consolidate.outputs.is_resume }}"
+          RESUME_AGENT="${{ steps.consolidate.outputs.resume_from_agent }}"
+          RESUME_PHASE="${{ steps.consolidate.outputs.resume_from_phase }}"
+
+          if [ "$IS_RESUME" != "true" ]; then
+            # Not in resume mode - don't skip anything
+            echo "skip_pre_documentation=false" >> "$GITHUB_OUTPUT"
+            echo "skip_pre_infrastructure=false" >> "$GITHUB_OUTPUT"
+            echo "skip_pre_security=false" >> "$GITHUB_OUTPUT"
+            echo "skip_planning_product=false" >> "$GITHUB_OUTPUT"
+            echo "skip_planning_ux=false" >> "$GITHUB_OUTPUT"
+            echo "skip_planning_tech_lead=false" >> "$GITHUB_OUTPUT"
+            echo "skip_development_software=false" >> "$GITHUB_OUTPUT"
+            echo "skip_development_infrastructure=false" >> "$GITHUB_OUTPUT"
+            echo "skip_post_test=false" >> "$GITHUB_OUTPUT"
+            echo "skip_post_security=false" >> "$GITHUB_OUTPUT"
+            echo "skip_post_documentation=false" >> "$GITHUB_OUTPUT"
+            echo "skip_project_manager=false" >> "$GITHUB_OUTPUT"
+            echo "skip_code_review=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Get the resume point index
+          RESUME_KEY="${RESUME_AGENT}:${RESUME_PHASE}"
+          RESUME_INDEX="${AGENT_ORDER[$RESUME_KEY]:-0}"
+
+          echo "Resume from: $RESUME_KEY (index: $RESUME_INDEX)"
+
+          # For each agent, check if its index < resume_index (should skip)
+          # skip_X=true means the agent already ran before the checkpoint
+
+          check_skip() {
+            local key="$1"
+            local idx="${AGENT_ORDER[$key]:-0}"
+            if [ "$idx" -lt "$RESUME_INDEX" ]; then
+              echo "true"
+            else
+              echo "false"
+            fi
+          }
+
+          echo "skip_pre_documentation=$(check_skip 'documentation-sheriff:pre')" >> "$GITHUB_OUTPUT"
+          echo "skip_pre_infrastructure=$(check_skip 'infrastructure-engineer:pre')" >> "$GITHUB_OUTPUT"
+          echo "skip_pre_security=$(check_skip 'security-engineer:pre')" >> "$GITHUB_OUTPUT"
+          echo "skip_planning_product=$(check_skip 'product-owner:main')" >> "$GITHUB_OUTPUT"
+          echo "skip_planning_ux=$(check_skip 'ux-designer:main')" >> "$GITHUB_OUTPUT"
+          echo "skip_planning_tech_lead=$(check_skip 'tech-lead:main')" >> "$GITHUB_OUTPUT"
+          echo "skip_development_software=$(check_skip 'software-engineer:main')" >> "$GITHUB_OUTPUT"
+          echo "skip_development_infrastructure=$(check_skip 'infrastructure-engineer:main')" >> "$GITHUB_OUTPUT"
+          echo "skip_post_test=$(check_skip 'test-engineer:post')" >> "$GITHUB_OUTPUT"
+          echo "skip_post_security=$(check_skip 'security-engineer:post')" >> "$GITHUB_OUTPUT"
+          echo "skip_post_documentation=$(check_skip 'documentation-sheriff:post')" >> "$GITHUB_OUTPUT"
+          echo "skip_project_manager=$(check_skip 'project-manager:post')" >> "$GITHUB_OUTPUT"
+          echo "skip_code_review=$(check_skip 'code-reviewer:review')" >> "$GITHUB_OUTPUT"
+
+          echo "Calculated skip flags based on resume from index $RESUME_INDEX"
+
+  # ============================================================================
   # HOTFIX MODE NOTIFICATION
   # ============================================================================
   hotfix-notify:
     name: Notify - Hotfix Mode
-    needs: orchestrate
-    if: needs.orchestrate.outputs.is_hotfix == 'true'
+    needs: pipeline-config
+    if: needs.pipeline-config.outputs.is_hotfix == 'true'
     uses: ./.github/workflows/discord-gpt-message.yml
     with:
       webhook_username: "Alex - Dev"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=AlexDev"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=AlexDev1"
       prompt: |
-        🚨 hotfix triggered for #${{ needs.orchestrate.outputs.issue_number }}
+        🚨 hotfix triggered for #${{ needs.pipeline-config.outputs.issue_number }}
 
         fast-tracking - skipping planning phase, going straight to implementation
 
-        context: ${{ needs.orchestrate.outputs.issue_context }}
+        context: ${{ needs.pipeline-config.outputs.issue_context }}
     secrets:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
@@ -549,51 +831,56 @@ jobs:
   pre_documentation_notify:
     name: Notify - Documentation Sheriff (Pre)
     uses: ./.github/workflows/discord-gpt-message.yml
-    needs: [orchestrate]
+    needs: [pipeline-config]
     if: |
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_documentation_sheriff == 'true'
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_documentation_sheriff == 'true'
     with:
       webhook_username: "Riley - Docs"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=RileyDocs"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=RileyDocs1"
       prompt: |
-        picking up issue #${{ needs.orchestrate.outputs.issue_number }}, checking what docs we have that might be relevant
+        picking up issue #${{ needs.pipeline-config.outputs.issue_number }}, checking what docs we have that might be relevant
 
-        context: ${{ needs.orchestrate.outputs.issue_context }}
+        my task: ${{ fromJson(needs.pipeline-config.outputs.agent_prompts).documentation_sheriff.prompt }}
     secrets:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
 
   pre_documentation:
     name: Documentation Sheriff (Pre)
-    needs: orchestrate
-    if: needs.orchestrate.outputs.activate_documentation_sheriff == 'true'
+    needs: pipeline-config
+    # Skip if: not activated OR flagged to skip in resume mode (already ran before checkpoint)
+    if: |
+      needs.pipeline-config.outputs.activate_documentation_sheriff == 'true' &&
+      needs.pipeline-config.outputs.skip_pre_documentation != 'true'
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: documentation-sheriff
       phase: pre
-      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
-      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
-      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
-      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
+      issue_number: ${{ needs.pipeline-config.outputs.issue_number }}
+      issue_context: ${{ needs.pipeline-config.outputs.issue_context }}
+      agent_prompts: ${{ needs.pipeline-config.outputs.agent_prompts }}
+      work_branch: ${{ needs.pipeline-config.outputs.work_branch }}
+      is_resume: ${{ needs.pipeline-config.outputs.is_resume }}
+      clarification_response: ${{ needs.pipeline-config.outputs.clarification_response }}
     secrets: inherit
 
   pre_infrastructure_notify:
     name: Notify - Infrastructure Engineer (Pre)
     uses: ./.github/workflows/discord-gpt-message.yml
-    needs: [orchestrate, pre_documentation]
+    needs: [pipeline-config, pre_documentation]
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_infrastructure_engineer == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_infrastructure_engineer == 'true' &&
       (needs.pre_documentation.result == 'success' || needs.pre_documentation.result == 'skipped')
     with:
       webhook_username: "Sam - Infra"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=SamInfra"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=SamInfra1"
       prompt: |
-        picking up #${{ needs.orchestrate.outputs.issue_number }}, gonna scope out infra requirements
+        picking up #${{ needs.pipeline-config.outputs.issue_number }}, gonna scope out infra requirements
 
-        context: ${{ needs.orchestrate.outputs.issue_context }}
+        my task: ${{ fromJson(needs.pipeline-config.outputs.agent_prompts).infrastructure_engineer.prompt }}
         docs notes: ${{ needs.pre_documentation.outputs.result || 'n/a' }}
     secrets:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -601,35 +888,40 @@ jobs:
 
   pre_infrastructure:
     name: Infrastructure Engineer (Pre)
-    needs: orchestrate
-    if: needs.orchestrate.outputs.activate_infrastructure_engineer == 'true'
+    needs: pipeline-config
+    # Skip if: not activated OR flagged to skip in resume mode (already ran before checkpoint)
+    if: |
+      needs.pipeline-config.outputs.activate_infrastructure_engineer == 'true' &&
+      needs.pipeline-config.outputs.skip_pre_infrastructure != 'true'
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: infrastructure-engineer
       phase: pre
-      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
-      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
-      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
-      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
+      issue_number: ${{ needs.pipeline-config.outputs.issue_number }}
+      issue_context: ${{ needs.pipeline-config.outputs.issue_context }}
+      agent_prompts: ${{ needs.pipeline-config.outputs.agent_prompts }}
+      work_branch: ${{ needs.pipeline-config.outputs.work_branch }}
+      is_resume: ${{ needs.pipeline-config.outputs.is_resume }}
+      clarification_response: ${{ needs.pipeline-config.outputs.clarification_response }}
     secrets: inherit
 
   pre_security_notify:
     name: Notify - Security Engineer (Pre)
     uses: ./.github/workflows/discord-gpt-message.yml
-    needs: [orchestrate, pre_documentation, pre_infrastructure]
+    needs: [pipeline-config, pre_documentation, pre_infrastructure]
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_security_engineer == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_security_engineer == 'true' &&
       (needs.pre_documentation.result == 'success' || needs.pre_documentation.result == 'skipped') &&
       (needs.pre_infrastructure.result == 'success' || needs.pre_infrastructure.result == 'skipped')
     with:
       webhook_username: "Casey - Security"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=CaseySec"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=CaseySec1"
       prompt: |
-        looking at #${{ needs.orchestrate.outputs.issue_number }} from a security angle now
+        looking at #${{ needs.pipeline-config.outputs.issue_number }} from a security angle now
 
-        context: ${{ needs.orchestrate.outputs.issue_context }}
+        my task: ${{ fromJson(needs.pipeline-config.outputs.agent_prompts).security_engineer.prompt }}
         docs notes: ${{ needs.pre_documentation.outputs.result || 'n/a' }}
         infra notes: ${{ needs.pre_infrastructure.outputs.result || 'n/a' }}
     secrets:
@@ -638,16 +930,21 @@ jobs:
 
   pre_security:
     name: Security Engineer (Pre)
-    needs: orchestrate
-    if: needs.orchestrate.outputs.activate_security_engineer == 'true'
+    needs: pipeline-config
+    # Skip if: not activated OR flagged to skip in resume mode (already ran before checkpoint)
+    if: |
+      needs.pipeline-config.outputs.activate_security_engineer == 'true' &&
+      needs.pipeline-config.outputs.skip_pre_security != 'true'
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: security-engineer
       phase: pre
-      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
-      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
-      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
-      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
+      issue_number: ${{ needs.pipeline-config.outputs.issue_number }}
+      issue_context: ${{ needs.pipeline-config.outputs.issue_context }}
+      agent_prompts: ${{ needs.pipeline-config.outputs.agent_prompts }}
+      work_branch: ${{ needs.pipeline-config.outputs.work_branch }}
+      is_resume: ${{ needs.pipeline-config.outputs.is_resume }}
+      clarification_response: ${{ needs.pipeline-config.outputs.clarification_response }}
     secrets: inherit
 
   # ============================================================================
@@ -656,23 +953,24 @@ jobs:
   pre_product_owner_notify:
     name: Notify - Product Owner (Pre)
     uses: ./.github/workflows/discord-gpt-message.yml
-    needs: [orchestrate, pre_documentation, pre_infrastructure, pre_security]
+    needs:
+      [pipeline-config, pre_documentation, pre_infrastructure, pre_security]
     # Skip in hotfix mode
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.is_hotfix != 'true' &&
-      needs.orchestrate.outputs.activate_product_owner == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.is_hotfix != 'true' &&
+      needs.pipeline-config.outputs.activate_product_owner == 'true' &&
       (needs.pre_documentation.result == 'success' || needs.pre_documentation.result == 'skipped') &&
       (needs.pre_infrastructure.result == 'success' || needs.pre_infrastructure.result == 'skipped') &&
       (needs.pre_security.result == 'success' || needs.pre_security.result == 'skipped')
     with:
       webhook_username: "Morgan - Product"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=MorganPO"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=MorganPO1"
       prompt: |
-        reviewing product requirements for #${{ needs.orchestrate.outputs.issue_number }}
+        reviewing product requirements for #${{ needs.pipeline-config.outputs.issue_number }}
 
-        context: ${{ needs.orchestrate.outputs.issue_context }}
+        my task: ${{ fromJson(needs.pipeline-config.outputs.agent_prompts).product_owner.prompt }}
         docs notes: ${{ needs.pre_documentation.outputs.result || 'n/a' }}
         infra notes: ${{ needs.pre_infrastructure.outputs.result || 'n/a' }}
         security notes: ${{ needs.pre_security.outputs.result || 'n/a' }}
@@ -682,21 +980,25 @@ jobs:
 
   planning_product:
     name: Product Owner
-    needs: [orchestrate, pre_documentation, pre_infrastructure, pre_security]
-    # Skip in hotfix mode - fast-track to implementation
+    needs:
+      [pipeline-config, pre_documentation, pre_infrastructure, pre_security]
+    # Skip if: hotfix mode, not activated, or flagged to skip in resume mode
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.is_hotfix != 'true' &&
-      needs.orchestrate.outputs.activate_product_owner == 'true'
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.is_hotfix != 'true' &&
+      needs.pipeline-config.outputs.activate_product_owner == 'true' &&
+      needs.pipeline-config.outputs.skip_planning_product != 'true'
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: product-owner
       phase: main
-      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
-      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
-      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
-      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
+      issue_number: ${{ needs.pipeline-config.outputs.issue_number }}
+      issue_context: ${{ needs.pipeline-config.outputs.issue_context }}
+      agent_prompts: ${{ needs.pipeline-config.outputs.agent_prompts }}
+      work_branch: ${{ needs.pipeline-config.outputs.work_branch }}
+      is_resume: ${{ needs.pipeline-config.outputs.is_resume }}
+      clarification_response: ${{ needs.pipeline-config.outputs.clarification_response }}
     secrets: inherit
 
   pre_ux_designer_notify:
@@ -704,7 +1006,7 @@ jobs:
     uses: ./.github/workflows/discord-gpt-message.yml
     needs:
       [
-        orchestrate,
+        pipeline-config,
         pre_documentation,
         pre_infrastructure,
         pre_security,
@@ -713,17 +1015,17 @@ jobs:
     # Skip in hotfix mode
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.is_hotfix != 'true' &&
-      needs.orchestrate.outputs.activate_ux_designer == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.is_hotfix != 'true' &&
+      needs.pipeline-config.outputs.activate_ux_designer == 'true' &&
       (needs.planning_product.result == 'success' || needs.planning_product.result == 'skipped')
     with:
       webhook_username: "Drew - UX"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=DrewUX"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=DrewUX1"
       prompt: |
-        thinking through ux for #${{ needs.orchestrate.outputs.issue_number }}
+        thinking through ux for #${{ needs.pipeline-config.outputs.issue_number }}
 
-        context: ${{ needs.orchestrate.outputs.issue_context }}
+        my task: ${{ fromJson(needs.pipeline-config.outputs.agent_prompts).ux_designer.prompt }}
         product notes: ${{ needs.planning_product.outputs.result || 'n/a' }}
     secrets:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -731,21 +1033,25 @@ jobs:
 
   planning_ux:
     name: UX Designer
-    needs: [orchestrate, pre_documentation, pre_infrastructure, pre_security]
-    # Skip in hotfix mode - fast-track to implementation
+    needs:
+      [pipeline-config, pre_documentation, pre_infrastructure, pre_security]
+    # Skip if: hotfix mode, not activated, or flagged to skip in resume mode
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.is_hotfix != 'true' &&
-      needs.orchestrate.outputs.activate_ux_designer == 'true'
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.is_hotfix != 'true' &&
+      needs.pipeline-config.outputs.activate_ux_designer == 'true' &&
+      needs.pipeline-config.outputs.skip_planning_ux != 'true'
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: ux-designer
       phase: main
-      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
-      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
-      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
-      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
+      issue_number: ${{ needs.pipeline-config.outputs.issue_number }}
+      issue_context: ${{ needs.pipeline-config.outputs.issue_context }}
+      agent_prompts: ${{ needs.pipeline-config.outputs.agent_prompts }}
+      work_branch: ${{ needs.pipeline-config.outputs.work_branch }}
+      is_resume: ${{ needs.pipeline-config.outputs.is_resume }}
+      clarification_response: ${{ needs.pipeline-config.outputs.clarification_response }}
     secrets: inherit
 
   pre_tech_lead_notify:
@@ -753,7 +1059,7 @@ jobs:
     uses: ./.github/workflows/discord-gpt-message.yml
     needs:
       [
-        orchestrate,
+        pipeline-config,
         pre_documentation,
         pre_infrastructure,
         pre_security,
@@ -763,18 +1069,18 @@ jobs:
     # Skip in hotfix mode
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.is_hotfix != 'true' &&
-      needs.orchestrate.outputs.activate_tech_lead == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.is_hotfix != 'true' &&
+      needs.pipeline-config.outputs.activate_tech_lead == 'true' &&
       (needs.planning_product.result == 'success' || needs.planning_product.result == 'skipped') &&
       (needs.planning_ux.result == 'success' || needs.planning_ux.result == 'skipped')
     with:
       webhook_username: "Taylor - Lead"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=TaylorLead"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=TaylorLead1"
       prompt: |
-        mapping out the architecture for #${{ needs.orchestrate.outputs.issue_number }}
+        mapping out the architecture for #${{ needs.pipeline-config.outputs.issue_number }}
 
-        context: ${{ needs.orchestrate.outputs.issue_context }}
+        my task: ${{ fromJson(needs.pipeline-config.outputs.agent_prompts).tech_lead.prompt }}
         product notes: ${{ needs.planning_product.outputs.result || 'n/a' }}
         ux notes: ${{ needs.planning_ux.outputs.result || 'n/a' }}
     secrets:
@@ -783,21 +1089,25 @@ jobs:
 
   planning_tech_lead:
     name: Tech Lead
-    needs: [orchestrate, pre_documentation, pre_infrastructure, pre_security]
-    # Skip in hotfix mode - fast-track to implementation
+    needs:
+      [pipeline-config, pre_documentation, pre_infrastructure, pre_security]
+    # Skip if: hotfix mode, not activated, or flagged to skip in resume mode
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.is_hotfix != 'true' &&
-      needs.orchestrate.outputs.activate_tech_lead == 'true'
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.is_hotfix != 'true' &&
+      needs.pipeline-config.outputs.activate_tech_lead == 'true' &&
+      needs.pipeline-config.outputs.skip_planning_tech_lead != 'true'
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: tech-lead
       phase: main
-      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
-      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
-      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
-      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
+      issue_number: ${{ needs.pipeline-config.outputs.issue_number }}
+      issue_context: ${{ needs.pipeline-config.outputs.issue_context }}
+      agent_prompts: ${{ needs.pipeline-config.outputs.agent_prompts }}
+      work_branch: ${{ needs.pipeline-config.outputs.work_branch }}
+      is_resume: ${{ needs.pipeline-config.outputs.is_resume }}
+      clarification_response: ${{ needs.pipeline-config.outputs.clarification_response }}
     secrets: inherit
 
   # ============================================================================
@@ -808,7 +1118,7 @@ jobs:
     uses: ./.github/workflows/discord-gpt-message.yml
     needs:
       [
-        orchestrate,
+        pipeline-config,
         pre_documentation,
         pre_infrastructure,
         pre_security,
@@ -818,18 +1128,18 @@ jobs:
       ]
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_software_engineer == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_software_engineer == 'true' &&
       (needs.planning_product.result == 'success' || needs.planning_product.result == 'skipped') &&
       (needs.planning_ux.result == 'success' || needs.planning_ux.result == 'skipped') &&
       (needs.planning_tech_lead.result == 'success' || needs.planning_tech_lead.result == 'skipped')
     with:
       webhook_username: "Alex - Dev"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=AlexDev"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=AlexDev1"
       prompt: |
-        starting implementation on #${{ needs.orchestrate.outputs.issue_number }}
+        starting implementation on #${{ needs.pipeline-config.outputs.issue_number }}
 
-        context: ${{ needs.orchestrate.outputs.issue_context }}
+        my task: ${{ fromJson(needs.pipeline-config.outputs.agent_prompts).software_engineer.prompt }}
         product notes: ${{ needs.planning_product.outputs.result || 'n/a' }}
         ux notes: ${{ needs.planning_ux.outputs.result || 'n/a' }}
         tech lead notes: ${{ needs.planning_tech_lead.outputs.result || 'n/a' }}
@@ -839,14 +1149,15 @@ jobs:
 
   development_software:
     name: Software Engineer
-    needs: [orchestrate, planning_product, planning_ux, planning_tech_lead]
-    # In hotfix mode, skip waiting for planning agents (they're skipped)
+    needs: [pipeline-config, planning_product, planning_ux, planning_tech_lead]
+    # Skip if: not activated, flagged to skip in resume mode, or (not hotfix and planning failed)
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_software_engineer == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_software_engineer == 'true' &&
+      needs.pipeline-config.outputs.skip_development_software != 'true' &&
       (
-        needs.orchestrate.outputs.is_hotfix == 'true' ||
+        needs.pipeline-config.outputs.is_hotfix == 'true' ||
         (
           (needs.planning_product.result == 'success' || needs.planning_product.result == 'skipped') &&
           (needs.planning_ux.result == 'success' || needs.planning_ux.result == 'skipped') &&
@@ -857,32 +1168,36 @@ jobs:
     with:
       agent_name: software-engineer
       phase: main
-      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
-      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
-      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
-      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
-      planning_context: |
+      issue_number: ${{ needs.pipeline-config.outputs.issue_number }}
+      issue_context: ${{ needs.pipeline-config.outputs.issue_context }}
+      agent_prompts: ${{ needs.pipeline-config.outputs.agent_prompts }}
+      work_branch: ${{ needs.pipeline-config.outputs.work_branch }}
+      is_resume: ${{ needs.pipeline-config.outputs.is_resume }}
+      clarification_response: ${{ needs.pipeline-config.outputs.clarification_response }}
+      planning_context: >-
         Product Owner: ${{ needs.planning_product.outputs.result || 'Not activated' }}
+
         UX Designer: ${{ needs.planning_ux.outputs.result || 'Not activated' }}
+
         Tech Lead: ${{ needs.planning_tech_lead.outputs.result || 'Not activated' }}
     secrets: inherit
 
   pre_test-engineer_notify:
     name: Notify - Test Engineer (Pre)
     uses: ./.github/workflows/discord-gpt-message.yml
-    needs: [orchestrate, development_software, development_infrastructure]
+    needs: [pipeline-config, development_software, development_infrastructure]
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_test_engineer == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_test_engineer == 'true' &&
       (needs.development_software.result == 'success' || needs.development_infrastructure.result == 'success')
     with:
       webhook_username: "Jamie - QA"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=JamieQA"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=JamieQA1"
       prompt: |
-        dev finished up on #${{ needs.orchestrate.outputs.issue_number }}, running tests now
+        dev finished up on #${{ needs.pipeline-config.outputs.issue_number }}, running tests now
 
-        context: ${{ needs.orchestrate.outputs.issue_context }}
+        my task: ${{ fromJson(needs.pipeline-config.outputs.agent_prompts).test_engineer.prompt }}
         dev notes: ${{ needs.development_software.outputs.result || 'n/a' }}
         infra notes: ${{ needs.development_infrastructure.outputs.result || 'n/a' }}
     secrets:
@@ -891,19 +1206,23 @@ jobs:
 
   development_infrastructure:
     name: Infrastructure Engineer (Main)
-    needs: [orchestrate, planning_tech_lead]
+    needs: [pipeline-config, planning_tech_lead]
+    # Skip if: not activated or flagged to skip in resume mode
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_infrastructure_engineer == 'true'
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_infrastructure_engineer == 'true' &&
+      needs.pipeline-config.outputs.skip_development_infrastructure != 'true'
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: infrastructure-engineer
       phase: main
-      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
-      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
-      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
-      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
+      issue_number: ${{ needs.pipeline-config.outputs.issue_number }}
+      issue_context: ${{ needs.pipeline-config.outputs.issue_context }}
+      agent_prompts: ${{ needs.pipeline-config.outputs.agent_prompts }}
+      work_branch: ${{ needs.pipeline-config.outputs.work_branch }}
+      is_resume: ${{ needs.pipeline-config.outputs.is_resume }}
+      clarification_response: ${{ needs.pipeline-config.outputs.clarification_response }}
       planning_context: |
         Tech Lead: ${{ needs.planning_tech_lead.outputs.result || 'Not activated' }}
     secrets: inherit
@@ -914,19 +1233,19 @@ jobs:
   post_infrastructure_notify:
     name: Notify - Infrastructure Engineer (Post)
     uses: ./.github/workflows/discord-gpt-message.yml
-    needs: [orchestrate, development_software, development_infrastructure]
+    needs: [pipeline-config, development_software, development_infrastructure]
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_infrastructure_engineer == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_infrastructure_engineer == 'true' &&
       (needs.development_infrastructure.result == 'success')
     with:
       webhook_username: "Sam - Infra"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=SamInfra"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=SamInfra1"
       prompt: |
-        validating infra changes for #${{ needs.orchestrate.outputs.issue_number }}
+        validating infra changes for #${{ needs.pipeline-config.outputs.issue_number }}
 
-        context: ${{ needs.orchestrate.outputs.issue_context }}
+        my task: ${{ fromJson(needs.pipeline-config.outputs.agent_prompts).infrastructure_engineer.prompt }}
         dev notes: ${{ needs.development_software.outputs.result || 'n/a' }}
         infra notes: ${{ needs.development_infrastructure.outputs.result || 'n/a' }}
     secrets:
@@ -935,40 +1254,49 @@ jobs:
 
   post_test:
     name: Test Engineer
-    needs: [orchestrate, development_software, development_infrastructure]
+    needs: [pipeline-config, development_software, development_infrastructure]
+    # Skip if: not activated, flagged to skip in resume mode, or no dev work succeeded
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_test_engineer == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_test_engineer == 'true' &&
+      needs.pipeline-config.outputs.skip_post_test != 'true' &&
       (needs.development_software.result == 'success' || needs.development_infrastructure.result == 'success')
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: test-engineer
       phase: post
-      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
-      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
-      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
-      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
+      issue_number: ${{ needs.pipeline-config.outputs.issue_number }}
+      issue_context: ${{ needs.pipeline-config.outputs.issue_context }}
+      agent_prompts: ${{ needs.pipeline-config.outputs.agent_prompts }}
+      work_branch: ${{ needs.pipeline-config.outputs.work_branch }}
+      is_resume: ${{ needs.pipeline-config.outputs.is_resume }}
+      clarification_response: ${{ needs.pipeline-config.outputs.clarification_response }}
     secrets: inherit
 
   post_security_notify:
     name: Notify - Security Engineer (Post)
     uses: ./.github/workflows/discord-gpt-message.yml
     needs:
-      [orchestrate, development_software, development_infrastructure, post_test]
+      [
+        pipeline-config,
+        development_software,
+        development_infrastructure,
+        post_test,
+      ]
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_security_engineer == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_security_engineer == 'true' &&
       (needs.development_software.result == 'success' || needs.development_infrastructure.result == 'success') &&
       (needs.post_test.result == 'success' || needs.post_test.result == 'skipped')
     with:
       webhook_username: "Casey - Security"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=CaseySec"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=CaseySec1"
       prompt: |
-        running security validation on #${{ needs.orchestrate.outputs.issue_number }}
+        running security validation on #${{ needs.pipeline-config.outputs.issue_number }}
 
-        context: ${{ needs.orchestrate.outputs.issue_context }}
+        my task: ${{ fromJson(needs.pipeline-config.outputs.agent_prompts).security_engineer.prompt }}
         dev notes: ${{ needs.development_software.outputs.result || 'n/a' }}
         infra notes: ${{ needs.development_infrastructure.outputs.result || 'n/a' }}
         test notes: ${{ needs.post_test.outputs.result || 'n/a' }}
@@ -978,20 +1306,24 @@ jobs:
 
   post_security:
     name: Security Engineer (Post)
-    needs: [orchestrate, development_software, development_infrastructure]
+    needs: [pipeline-config, development_software, development_infrastructure]
+    # Skip if: not activated, flagged to skip in resume mode, or no dev work succeeded
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_security_engineer == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_security_engineer == 'true' &&
+      needs.pipeline-config.outputs.skip_post_security != 'true' &&
       (needs.development_software.result == 'success' || needs.development_infrastructure.result == 'success')
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: security-engineer
       phase: post
-      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
-      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
-      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
-      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
+      issue_number: ${{ needs.pipeline-config.outputs.issue_number }}
+      issue_context: ${{ needs.pipeline-config.outputs.issue_context }}
+      agent_prompts: ${{ needs.pipeline-config.outputs.agent_prompts }}
+      work_branch: ${{ needs.pipeline-config.outputs.work_branch }}
+      is_resume: ${{ needs.pipeline-config.outputs.is_resume }}
+      clarification_response: ${{ needs.pipeline-config.outputs.clarification_response }}
     secrets: inherit
 
   post_documentation_notify:
@@ -999,7 +1331,7 @@ jobs:
     uses: ./.github/workflows/discord-gpt-message.yml
     needs:
       [
-        orchestrate,
+        pipeline-config,
         development_software,
         development_infrastructure,
         post_test,
@@ -1007,18 +1339,18 @@ jobs:
       ]
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_documentation_sheriff == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_documentation_sheriff == 'true' &&
       (needs.development_software.result == 'success' || needs.development_infrastructure.result == 'success') &&
       (needs.post_test.result == 'success' || needs.post_test.result == 'skipped') &&
       (needs.post_security.result == 'success' || needs.post_security.result == 'skipped')
     with:
       webhook_username: "Riley - Docs"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=RileyDocs"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=RileyDocs1"
       prompt: |
-        updating docs for #${{ needs.orchestrate.outputs.issue_number }}
+        updating docs for #${{ needs.pipeline-config.outputs.issue_number }}
 
-        context: ${{ needs.orchestrate.outputs.issue_context }}
+        my task: ${{ fromJson(needs.pipeline-config.outputs.agent_prompts).documentation_sheriff.prompt }}
         dev notes: ${{ needs.development_software.outputs.result || 'n/a' }}
         infra notes: ${{ needs.development_infrastructure.outputs.result || 'n/a' }}
         test notes: ${{ needs.post_test.outputs.result || 'n/a' }}
@@ -1030,20 +1362,29 @@ jobs:
   post_documentation:
     name: Documentation Sheriff (Post)
     needs:
-      [orchestrate, development_software, development_infrastructure, post_test]
+      [
+        pipeline-config,
+        development_software,
+        development_infrastructure,
+        post_test,
+      ]
+    # Skip if: not activated, flagged to skip in resume mode, or no dev work succeeded
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_documentation_sheriff == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_documentation_sheriff == 'true' &&
+      needs.pipeline-config.outputs.skip_post_documentation != 'true' &&
       (needs.development_software.result == 'success' || needs.development_infrastructure.result == 'success')
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: documentation-sheriff
       phase: post
-      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
-      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
-      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
-      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
+      issue_number: ${{ needs.pipeline-config.outputs.issue_number }}
+      issue_context: ${{ needs.pipeline-config.outputs.issue_context }}
+      agent_prompts: ${{ needs.pipeline-config.outputs.agent_prompts }}
+      work_branch: ${{ needs.pipeline-config.outputs.work_branch }}
+      is_resume: ${{ needs.pipeline-config.outputs.is_resume }}
+      clarification_response: ${{ needs.pipeline-config.outputs.clarification_response }}
     secrets: inherit
 
   # ============================================================================
@@ -1052,21 +1393,21 @@ jobs:
   post_project-manager-notify:
     name: Notify - Project Manager (Pre)
     uses: ./.github/workflows/discord-gpt-message.yml
-    needs: [orchestrate, post_test, post_security, post_documentation]
+    needs: [pipeline-config, post_test, post_security, post_documentation]
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_project_manager == 'true' &&
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_project_manager == 'true' &&
       (needs.post_test.result == 'success' || needs.post_test.result == 'skipped') &&
       (needs.post_security.result == 'success' || needs.post_security.result == 'skipped') &&
       (needs.post_documentation.result == 'success' || needs.post_documentation.result == 'skipped')
     with:
       webhook_username: "Jordan - PM"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=JordanPM"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=JordanPM1"
       prompt: |
-        wrapping up project tracking for #${{ needs.orchestrate.outputs.issue_number }}
+        wrapping up project tracking for #${{ needs.pipeline-config.outputs.issue_number }}
 
-        context: ${{ needs.orchestrate.outputs.issue_context }}
+        my task: ${{ fromJson(needs.pipeline-config.outputs.agent_prompts).project_manager.prompt }}
         test notes: ${{ needs.post_test.outputs.result || 'n/a' }}
         security notes: ${{ needs.post_security.outputs.result || 'n/a' }}
         docs notes: ${{ needs.post_documentation.outputs.result || 'n/a' }}
@@ -1076,19 +1417,23 @@ jobs:
 
   project-management:
     name: Project Manager
-    needs: [orchestrate, post_test, post_security, post_documentation]
+    needs: [pipeline-config, post_test, post_security, post_documentation]
+    # Skip if: not activated or flagged to skip in resume mode
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
-      needs.orchestrate.outputs.activate_project_manager == 'true'
+      needs.pipeline-config.result == 'success' &&
+      needs.pipeline-config.outputs.activate_project_manager == 'true' &&
+      needs.pipeline-config.outputs.skip_project_manager != 'true'
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: project-manager
       phase: post
-      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
-      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
-      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
-      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
+      issue_number: ${{ needs.pipeline-config.outputs.issue_number }}
+      issue_context: ${{ needs.pipeline-config.outputs.issue_context }}
+      agent_prompts: ${{ needs.pipeline-config.outputs.agent_prompts }}
+      work_branch: ${{ needs.pipeline-config.outputs.work_branch }}
+      is_resume: ${{ needs.pipeline-config.outputs.is_resume }}
+      clarification_response: ${{ needs.pipeline-config.outputs.clarification_response }}
     secrets: inherit
 
   # ============================================================================
@@ -1097,22 +1442,22 @@ jobs:
   create-pr-notify:
     name: Notify - Create PR (Pre)
     uses: ./.github/workflows/discord-gpt-message.yml
-    needs: [orchestrate, create-pr]
+    needs: [pipeline-config, create-pr]
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
+      needs.pipeline-config.result == 'success' &&
       needs.create-pr.result == 'success' &&
       needs.create-pr.outputs.has_changes == 'true'
     with:
       webhook_username: "Jordan - PM"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=JordanPM"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=JordanPM1"
       prompt: |
         <@${{ vars.DISCORD_TEAM_LEAD_USER_ID }}> PR ready for review!
 
-        pr is up for #${{ needs.orchestrate.outputs.issue_number }}
+        pr is up for #${{ needs.pipeline-config.outputs.issue_number }}
         url: ${{ needs.create-pr.outputs.pr_url }}
-        context: ${{ needs.orchestrate.outputs.issue_context }}
-        branch: ${{ needs.orchestrate.outputs.work_branch }}
+        context: ${{ needs.pipeline-config.outputs.issue_context }}
+        branch: ${{ needs.pipeline-config.outputs.work_branch }}
     secrets:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_PR_WEBHOOK_URL }}
@@ -1121,7 +1466,7 @@ jobs:
     name: Create Pull Request
     needs:
       [
-        orchestrate,
+        pipeline-config,
         planning_product,
         planning_ux,
         planning_tech_lead,
@@ -1134,7 +1479,7 @@ jobs:
       ]
     if: |
       always() &&
-      needs.orchestrate.result == 'success'
+      needs.pipeline-config.result == 'success'
     runs-on: ubuntu-latest
     outputs:
       pr_number: ${{ steps['create-pr'].outputs.pr_number }}
@@ -1146,12 +1491,12 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
-          ref: ${{ needs.orchestrate.outputs.work_branch }}
+          ref: ${{ needs.pipeline-config.outputs.work_branch }}
 
       - name: Get issue number
         id: issue
         run: |
-          echo "number=${{ needs.orchestrate.outputs.issue_number }}" >> $GITHUB_OUTPUT
+          echo "number=${{ needs.pipeline-config.outputs.issue_number }}" >> $GITHUB_OUTPUT
 
       - name: Check for changes vs main
         id: changes
@@ -1222,7 +1567,7 @@ jobs:
           ISSUE_TITLE: ${{ steps.issue_details.outputs.title }}
           ISSUE_BODY: ${{ steps.issue_details.outputs.body }}
           ISSUE_LABELS: ${{ steps.issue_details.outputs.labels }}
-          ISSUE_CONTEXT: ${{ needs.orchestrate.outputs.issue_context }}
+          ISSUE_CONTEXT: ${{ needs.pipeline-config.outputs.issue_context }}
           PRODUCT_RESULT: ${{ needs.planning_product.outputs.result }}
           UX_RESULT: ${{ needs.planning_ux.outputs.result }}
           TECH_LEAD_RESULT: ${{ needs.planning_tech_lead.outputs.result }}
@@ -1405,11 +1750,12 @@ jobs:
         env:
           GENERATED_TITLE: ${{ steps.generate_pr.outputs.pr_title }}
           GENERATED_BODY: ${{ steps.generate_pr.outputs.pr_body }}
+          AGENT_PROMPTS: ${{ needs.pipeline-config.outputs.agent_prompts }}
         with:
           github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
           script: |
             const issueNumber = ${{ steps.issue.outputs.number }};
-            const branchName = `${{ needs.orchestrate.outputs.work_branch }}`;
+            const branchName = `${{ needs.pipeline-config.outputs.work_branch }}`;
 
             // Check if a PR already exists for this branch
             const { data: existingPRs } = await github.rest.pulls.list({
@@ -1434,7 +1780,7 @@ jobs:
             const generatedBody = process.env.GENERATED_BODY || 'Automated PR for issue.';
 
             // Embed agent_prompts JSON for fix-review-feedback workflow to retrieve
-            const agentPromptsJson = JSON.stringify(${{ needs.orchestrate.outputs.agent_prompts }});
+            const agentPromptsJson = process.env.AGENT_PROMPTS || '{}';
 
             // Combine generated body with required metadata
             const prBody = [
@@ -1468,19 +1814,19 @@ jobs:
   code-review-notify:
     name: Notify - Code Reviewer (Pre)
     uses: ./.github/workflows/discord-gpt-message.yml
-    needs: [orchestrate, create-pr]
+    needs: [pipeline-config, create-pr]
     if: |
       always() &&
-      needs.orchestrate.result == 'success' &&
+      needs.pipeline-config.result == 'success' &&
       needs.create-pr.result == 'success' &&
       needs.create-pr.outputs.pr_number != ''
     with:
       webhook_username: "Avery - Review"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=AveryReview"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=AveryReview1"
       prompt: |
-        reviewing pr for #${{ needs.orchestrate.outputs.issue_number }}
+        reviewing pr for #${{ needs.pipeline-config.outputs.issue_number }}
 
-        context: ${{ needs.orchestrate.outputs.issue_context }}
+        context: ${{ needs.pipeline-config.outputs.issue_context }}
         pr: ${{ needs.create-pr.outputs.pr_url }}
     secrets:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -1488,29 +1834,107 @@ jobs:
 
   code-review:
     name: Code Reviewer
-    needs: [orchestrate, create-pr]
+    needs: [pipeline-config, create-pr]
+    # Skip if: no PR created, or flagged to skip in resume mode
     if: |
       always() &&
       needs['create-pr'].result == 'success' &&
-      needs['create-pr'].outputs.pr_number != ''
+      needs['create-pr'].outputs.pr_number != '' &&
+      needs.pipeline-config.outputs.skip_code_review != 'true'
     uses: ./.github/workflows/agent-step.yml
     with:
       agent_name: code-reviewer
       phase: review
-      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
-      issue_context: ${{ needs.orchestrate.outputs.issue_context }}
-      agent_prompts: ${{ needs.orchestrate.outputs.agent_prompts }}
+      issue_number: ${{ needs.pipeline-config.outputs.issue_number }}
+      issue_context: ${{ needs.pipeline-config.outputs.issue_context }}
+      agent_prompts: ${{ needs.pipeline-config.outputs.agent_prompts }}
       pr_number: ${{ needs['create-pr'].outputs.pr_number }}
-      work_branch: ${{ needs.orchestrate.outputs.work_branch }}
+      work_branch: ${{ needs.pipeline-config.outputs.work_branch }}
+      is_resume: ${{ needs.pipeline-config.outputs.is_resume }}
+      clarification_response: ${{ needs.pipeline-config.outputs.clarification_response }}
     secrets: inherit
+
+  # ============================================================================
+  # STAGE 8.5: COUNTING APPROVAL (github-actions[bot])
+  # ============================================================================
+  actions-approve:
+    name: Approve PR (github-actions[bot])
+    needs: [create-pr, code-review]
+    if: |
+      always() &&
+      needs.create-pr.result == 'success' &&
+      needs.create-pr.outputs.pr_number != ''
+    runs-on: ubuntu-latest
+    outputs:
+      approved: ${{ steps.gate.outputs.approve }}
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Decide if we should approve
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REVIEW_TEXT='${{ needs.code-review.outputs.result }}'
+
+          # Heuristic: only approve if the reviewer output looks like an approval.
+          # Tweak these keywords to match what your code-review agent emits.
+          if echo "$REVIEW_TEXT" | grep -qiE '\b(APPROVED|LGTM|SHIP IT)\b'; then
+            echo "approve=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "approve=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Submit approval review as github-actions[bot]
+        if: steps.gate.outputs.approve == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }} # <-- this is github-actions[bot]
+          script: |
+            const prNumber = parseInt('${{ needs.create-pr.outputs.pr_number }}', 10);
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              event: "APPROVE",
+              body: "Pull request was vetted by team and approved."
+            });
+
+            console.log(`Approved PR #${prNumber} as github-actions[bot]`);
+
+      - name: Trigger fix-review-feedback on rejection
+        if: steps.gate.outputs.approve == 'false'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const prNumber = parseInt('${{ needs.create-pr.outputs.pr_number }}', 10);
+
+            console.log(`Code review rejected PR #${prNumber}, triggering fix-review-feedback workflow`);
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'fix-review-feedback.yml',
+              ref: 'main',
+              inputs: {
+                pr_number: String(prNumber)
+              }
+            });
+
+            console.log(`Triggered fix-review-feedback for PR #${prNumber}`);
 
   # ============================================================================
   # STAGE 9: WRAP-UP
   # ============================================================================
   wrap-up:
     name: Wrap Up Session
-    needs: [orchestrate, code-review, create-pr]
-    if: always() && needs.orchestrate.result == 'success'
+    needs: [pipeline-config, code-review, create-pr]
+    if: always() && needs.pipeline-config.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout work branch
@@ -1518,14 +1942,14 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
-          ref: ${{ needs.orchestrate.outputs.work_branch }}
+          ref: ${{ needs.pipeline-config.outputs.work_branch }}
 
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin "${{ needs.orchestrate.outputs.work_branch }}"
-          git checkout -B "${{ needs.orchestrate.outputs.work_branch }}" "origin/${{ needs.orchestrate.outputs.work_branch }}"
+          git fetch origin "${{ needs.pipeline-config.outputs.work_branch }}"
+          git checkout -B "${{ needs.pipeline-config.outputs.work_branch }}" "origin/${{ needs.pipeline-config.outputs.work_branch }}"
 
       - name: Append to DEVLOG.md
         uses: anthropics/claude-code-action@v1
@@ -1539,14 +1963,14 @@ jobs:
             You are the Pipeline Orchestrator wrapping up a session.
 
             ## Session Summary
-            - Issue: #${{ needs.orchestrate.outputs.issue_number }}
-            - Context: ${{ needs.orchestrate.outputs.issue_context }}
+            - Issue: #${{ needs.pipeline-config.outputs.issue_number }}
+            - Context: ${{ needs.pipeline-config.outputs.issue_context }}
             ${{ needs['create-pr'].outputs.pr_url && format('- PR Created: {0}', needs['create-pr'].outputs.pr_url) || '' }}
             ${{ needs['code-review'].result && format('- Code Review Result: {0}', needs['code-review'].result) || '' }}
             ${{ needs['code-review'].outputs.result || '' }}
 
             ## Your Task
-            1. Read the issue context file at working/issues/ for issue #${{ needs.orchestrate.outputs.issue_number }}
+            1. Read the issue context file at working/issues/ for issue #${{ needs.pipeline-config.outputs.issue_number }}
             2. Grep DEVLOG.md for "## Session" to find the last session entry
             3. Append a new session entry to DEVLOG.md with:
                - Session timestamp
@@ -1577,3 +2001,36 @@ jobs:
 
             ---
             ```
+
+  # ============================================================================
+  # STAGE 10: TRIGGER AUTO-MERGE
+  # ============================================================================
+  trigger-auto-merge:
+    name: Trigger Auto-Merge
+    needs: [pipeline-config, create-pr, actions-approve, wrap-up]
+    if: |
+      always() &&
+      needs.create-pr.result == 'success' &&
+      needs.create-pr.outputs.pr_number != '' &&
+      needs.actions-approve.result == 'success' &&
+      needs.actions-approve.outputs.approved == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger auto-merge workflow
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const prNumber = parseInt('${{ needs.create-pr.outputs.pr_number }}', 10);
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'auto-merge.yml',
+              ref: 'main',
+              inputs: {
+                pr_number: String(prNumber)
+              }
+            });
+
+            console.log(`Triggered auto-merge workflow for PR #${prNumber}`);

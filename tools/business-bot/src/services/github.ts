@@ -592,6 +592,8 @@ export interface PipelineSecrets {
   DISCORD_DEV_WEBHOOK_URL?: string;
   DISCORD_PRODUCT_WEBHOOK_URL?: string;
   OPENAI_API_KEY?: string;
+  // E2E Testing
+  DISCORD_E2E_WEBHOOK_URL?: string;
 }
 
 export interface PipelineVariables {
@@ -599,6 +601,8 @@ export interface PipelineVariables {
   DISCORD_DEV_CHANNEL_ID?: string;
   DISCORD_PR_CHANNEL_ID?: string;
   DISCORD_TEAM_LEAD_USER_ID?: string;
+  // E2E Testing
+  APP_PUBLIC_DOMAIN?: string;
 }
 
 export async function configureRepositoryForPipelines(
@@ -642,6 +646,74 @@ export async function configureRepositoryForPipelines(
     success: errors.length === 0,
     secretsSet,
     variablesSet,
+    errors,
+  };
+}
+
+export interface TemplateRepoConfig {
+  secrets: string[];
+  variables: Array<{ name: string; value: string }>;
+}
+
+export async function getTemplateRepoConfig(
+  templateOwner: string,
+  templateRepo: string
+): Promise<TemplateRepoConfig> {
+  const secrets = await listRepositorySecrets(templateOwner, templateRepo);
+  const variables = await listRepositoryVariables(templateOwner, templateRepo);
+
+  return {
+    secrets,
+    variables,
+  };
+}
+
+export async function scaffoldRepoSecretsAndVariables(
+  targetOwner: string,
+  targetRepo: string,
+  templateOwner: string,
+  templateRepo: string,
+  secretValues: Record<string, string>
+): Promise<{
+  secretsSet: string[];
+  variablesSet: string[];
+  missingSecrets: string[];
+  errors: string[];
+}> {
+  const templateConfig = await getTemplateRepoConfig(templateOwner, templateRepo);
+
+  const secretsSet: string[] = [];
+  const variablesSet: string[] = [];
+  const missingSecrets: string[] = [];
+  const errors: string[] = [];
+
+  for (const secretName of templateConfig.secrets) {
+    const value = secretValues[secretName];
+    if (value) {
+      const success = await setRepositorySecret(targetOwner, targetRepo, secretName, value);
+      if (success) {
+        secretsSet.push(secretName);
+      } else {
+        errors.push(`Failed to set secret: ${secretName}`);
+      }
+    } else {
+      missingSecrets.push(secretName);
+    }
+  }
+
+  for (const variable of templateConfig.variables) {
+    const success = await setRepositoryVariable(targetOwner, targetRepo, variable.name, variable.value);
+    if (success) {
+      variablesSet.push(variable.name);
+    } else {
+      errors.push(`Failed to set variable: ${variable.name}`);
+    }
+  }
+
+  return {
+    secretsSet,
+    variablesSet,
+    missingSecrets,
     errors,
   };
 }

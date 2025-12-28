@@ -323,7 +323,7 @@ jobs:
                 footer: { text: "Automated Weekly Standup" }
               }],
               username: "Jordan - PM",
-              avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=JordanPM"
+              avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=JordanPM1"
             }')
 
           curl -sS -X POST \
@@ -364,7 +364,7 @@ jobs:
           MESSAGE=$(jq -n \
             --arg content "## 📊 Weekly Summary - ${DATE}\n\n$SUMMARY" \
             --arg username "Jordan - PM" \
-            --arg avatar "https://api.dicebear.com/9.x/bottts/png?seed=JordanPM" \
+            --arg avatar "https://api.dicebear.com/9.x/personas/png?seed=JordanPM1" \
             '{
               content: $content,
               username: $username,

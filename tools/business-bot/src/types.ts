@@ -56,11 +56,19 @@ export interface ProjectGitHubResource {
   isPrivate: boolean;
 }
 
+export interface DiscordChannelInfo {
+  id: string;
+  name: string;
+  webhookUrl?: string;
+}
+
 export interface ProjectDiscordResource {
   serverId: string;
   serverName: string;
   inviteUrl?: string;
   channels: string[];
+  channelIds?: Record<string, string>;
+  webhooks?: Record<string, string>;
 }
 
 export interface ProjectApprovals {

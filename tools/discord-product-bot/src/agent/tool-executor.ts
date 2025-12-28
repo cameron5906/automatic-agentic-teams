@@ -39,7 +39,23 @@ import {
   discord_react,
   discord_create_thread,
   discord_reply_thread,
+  discord_post_draft_message,
+  discord_reply_to_draft,
 } from '../tools/discord-tools.js';
+import {
+  ticket_start_flow,
+  ticket_update_field,
+  update_draft,
+  ticket_get_draft,
+  ticket_get_draft_message,
+  ticket_preview,
+  ticket_file_issue,
+  ticket_cancel,
+  ticket_decompose_epic,
+  ticket_file_epic_with_children,
+  ticket_list_types,
+  ticket_get_field_info,
+} from '../tools/ticket-tools.js';
 
 export async function executeToolCall(
   toolCall: ChatCompletionMessageToolCall,
@@ -255,6 +271,54 @@ export async function executeToolCall(
           args.content as string
         );
         return { success: true, data: { replied: true } };
+      }
+      case 'discord_post_draft_message': {
+        return await discord_post_draft_message(context, args.content as string);
+      }
+      case 'discord_reply_to_draft': {
+        return await discord_reply_to_draft(context, args.content as string);
+      }
+
+      // Ticket flow tools
+      case 'ticket_start_flow': {
+        return await ticket_start_flow(context, args.content as string);
+      }
+      case 'update_draft': {
+        const value = args.value as string;
+        const fieldName = args.field_name as string;
+        const replyMessage = args.reply_message as string;
+        const values = value.includes('\n') ? value.split('\n').filter(Boolean) : value;
+        return await update_draft(context, fieldName, values, replyMessage);
+      }
+      case 'ticket_get_draft': {
+        return ticket_get_draft(context);
+      }
+      case 'ticket_get_draft_message': {
+        return ticket_get_draft_message(context);
+      }
+      case 'ticket_preview': {
+        return ticket_preview(context);
+      }
+      case 'ticket_file_issue': {
+        return await ticket_file_issue(context);
+      }
+      case 'ticket_cancel': {
+        return ticket_cancel(context);
+      }
+      case 'ticket_decompose_epic': {
+        return await ticket_decompose_epic(context);
+      }
+      case 'ticket_file_epic_with_children': {
+        return await ticket_file_epic_with_children(context);
+      }
+      case 'ticket_list_types': {
+        return ticket_list_types();
+      }
+      case 'ticket_get_field_info': {
+        return ticket_get_field_info(
+          args.issue_type as string,
+          args.field_name as string
+        );
       }
 
       default:

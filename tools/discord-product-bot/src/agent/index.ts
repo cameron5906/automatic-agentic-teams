@@ -96,6 +96,26 @@ export async function runAgent(
     };
   });
 
+  // Build attachment info text if there are images
+  // CRITICAL: Only provide S3 URLs to the LLM. The Discord CDN URLs are used internally
+  // for vision but must NEVER be referenced in issues (they expire).
+  let attachmentInfo = '';
+  const imagesWithPermanentUrls = context.images.filter((img) => img.permanentUrl);
+
+  if (imagesWithPermanentUrls.length > 0) {
+    attachmentInfo = '\n\n---\n**ATTACHED IMAGES - USE THESE URLs ONLY:**\n';
+    for (let i = 0; i < imagesWithPermanentUrls.length; i++) {
+      const img = imagesWithPermanentUrls[i];
+      attachmentInfo += `- **${img.name}**: ${img.permanentUrl}\n`;
+    }
+    attachmentInfo += '\nWhen embedding images in issues, use ONLY the URLs listed above. Example: `![description](URL_FROM_ABOVE)`\n---';
+  } else if (context.images.length > 0) {
+    // S3 not configured or upload failed - warn the LLM not to embed images
+    attachmentInfo = '\n\n---\n**ATTACHED IMAGES (NO PERMANENT URLs AVAILABLE)**\n';
+    attachmentInfo += 'Images were attached but permanent URLs are not available. ';
+    attachmentInfo += 'Do NOT embed image URLs in issues - they will expire.\n---';
+  }
+
   // Build multimodal content array with text and any attached images
   const userContent: ChatCompletionContentPart[] = [
     {
@@ -104,16 +124,19 @@ export async function runAgent(
       // (Discord does not support threads inside threads).
       text:
         context.threadId
-          ? `Message from Discord user @${context.author} in thread ${context.threadId} (parent channel ${context.channelId}):\n\n${userMessage}`
-          : `Message from Discord user @${context.author} in channel ${context.channelId}:\n\n${userMessage}`,
+          ? `Message from Discord user @${context.author} in thread ${context.threadId} (parent channel ${context.channelId}):\n\n${userMessage}${attachmentInfo}`
+          : `Message from Discord user @${context.author} in channel ${context.channelId}:\n\n${userMessage}${attachmentInfo}`,
     },
   ];
 
+  // Pass images using S3 URL only - never expose Discord CDN URLs to the LLM
   for (const img of context.images) {
-    userContent.push({
-      type: 'image_url' as const,
-      image_url: { url: img.url },
-    });
+    if (img.permanentUrl) {
+      userContent.push({
+        type: 'image_url' as const,
+        image_url: { url: img.permanentUrl },
+      });
+    }
   }
 
   const messages: ChatCompletionMessageParam[] = [

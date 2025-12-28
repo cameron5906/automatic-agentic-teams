@@ -14,6 +14,10 @@ import {
   setThreadRegistryPersistence,
   hydrateThreadRegistryFromPersistence,
 } from './context/thread-registry.js';
+import {
+  setDraftStorePersistence,
+  hydrateDraftStoreFromPersistence,
+} from './ticket-flows/draft-store.js';
 
 const client = new Client({
   intents: [
@@ -33,8 +37,10 @@ client.once(Events.ClientReady, (c) => {
     const sqliteStore = initSqliteStateStore(config.persistence.sqlitePath);
     setConversationStorePersistence(sqliteStore);
     setThreadRegistryPersistence(sqliteStore);
+    setDraftStorePersistence(sqliteStore);
     hydrateConversationStoreFromPersistence();
     hydrateThreadRegistryFromPersistence();
+    hydrateDraftStoreFromPersistence();
     console.log(`Loaded persisted bot state from: ${config.persistence.sqlitePath}`);
   } catch (error) {
     console.error('Failed to initialize persistence; continuing without it:', error);

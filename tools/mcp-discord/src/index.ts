@@ -14,7 +14,7 @@ const AGENT_NAME = process.env.AGENT_NAME || "Claude Agent";
 const generateAvatarUrl = (agentName: string): string => {
   // Convert agent name to a seed by removing spaces and special characters
   const seed = agentName.replace(/[^a-zA-Z0-9]/g, '');
-  return `https://api.dicebear.com/9.x/bottts/png?seed=${seed}`;
+  return `https://api.dicebear.com/9.x/personas/png?seed=${seed}1`;
 };
 
 const AVATAR_URL = generateAvatarUrl(AGENT_NAME);

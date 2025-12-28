@@ -42,8 +42,18 @@ export const config = {
     },
     model: 'gpt-4o',
   },
+  s3: {
+    get enabled(): boolean {
+      return !!optionalEnv('S3_ATTACHMENTS_BUCKET');
+    },
+    get bucket(): string {
+      return requireEnv('S3_ATTACHMENTS_BUCKET');
+    },
+    get region(): string {
+      return optionalEnv('S3_ATTACHMENTS_REGION') ?? 'us-east-1';
+    },
+  },
   persistence: {
-    // Set BOT_SQLITE_PATH to a durable volume path in production (e.g., ECS task volume).
     sqlitePath:
       optionalEnv('BOT_SQLITE_PATH') ??
       './working/discord-product-bot/bot-state.sqlite',

@@ -254,9 +254,11 @@ jobs:
         with:
           github_token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          use_bedrock: false
+          use_vertex: false
           claude_args: >-
             --model claude-opus-4-5-20251101
-            --max-turns 10
+            --max-turns 500
           prompt: |
             You are the Onboarding Documentation Generator. Update documentation to reflect current project structure.
 
@@ -373,7 +375,7 @@ jobs:
     uses: ./.github/workflows/discord-gpt-message.yml
     with:
       webhook_username: "Riley - Docs"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=RileyDocs"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=RileyDocs1"
       prompt: |
         📝 onboarding docs updated based on recent changes to: ${{ needs.detect-changes.outputs.changed_areas }}
 

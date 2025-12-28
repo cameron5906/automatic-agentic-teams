@@ -19,7 +19,8 @@ github-auto-team/
 │   └── ci-tools.yml            # CI for tools (build, test, Docker)
 ├── tools/
 │   ├── discord-product-bot/    # Always-on Discord bot (Fargate)
-│   └── mcp-discord/            # MCP server for agent Discord updates
+│   ├── mcp-discord/            # MCP server for agent Discord updates
+│   └── mcp-clarification/      # MCP server for human clarification requests
 ├── docs/
 │   ├── README.md               # Documentation index
 │   ├── adr/
@@ -134,12 +135,16 @@ Entry format: `- [ ] {description} - Found in #{issue}, {agent}, YYYY-MM-DD`
 | Secret | Description |
 |--------|-------------|
 | `ANTHROPIC_API_KEY` | Claude API access |
-| `CLAUDE_WORKFLOW_TOKEN` | GitHub PAT with workflow file edit permissions |
+| `CLAUDE_WORKFLOW_TOKEN` | GitHub PAT with workflow file edit permissions (PR author) |
+| `PR_REVIEW_PAT` | GitHub PAT for PR reviews (must be different user than CLAUDE_WORKFLOW_TOKEN for auto-merge) |
 | `DISCORD_DEV_WEBHOOK_URL` | Discord webhook for agent dev updates |
 | `DISCORD_PRODUCT_WEBHOOK_URL` | Discord webhook for product channel updates |
+| `DISCORD_E2E_WEBHOOK_URL` | Discord webhook for E2E test notifications |
 | `AWS_ROLE_ARN` | IAM role ARN for GitHub Actions OIDC (bot deployment) |
 | `DISCORD_BOT_TOKEN` | Discord bot token (bot deployment) |
-| `OPENAI_API_KEY` | OpenAI API key (bot deployment, issue relay) |
+| `OPENAI_API_KEY` | OpenAI API key (bot deployment, issue relay, E2E tests) |
+| `E2E_TEST_USERNAME` | Username for app authentication in E2E tests (optional) |
+| `E2E_TEST_PASSWORD` | Password for app authentication in E2E tests (optional) |
 
 ## Variables (Required for Bot)
 
@@ -149,6 +154,7 @@ Entry format: `- [ ] {description} - Found in #{issue}, {agent}, YYYY-MM-DD`
 | `DISCORD_DEV_CHANNEL_ID` | #dev channel ID |
 | `DISCORD_PR_CHANNEL_ID` | #pull-requests channel ID |
 | `DISCORD_TEAM_LEAD_USER_ID` | User ID to ping for approvals |
+| `TEAM_LEAD_USERNAME` | GitHub username to tag in clarification requests |
 
 ## Variables (Optional)
 
@@ -165,6 +171,7 @@ Entry format: `- [ ] {description} - Found in #{issue}, {agent}, YYYY-MM-DD`
 ### Discord Product Bot (`tools/discord-product-bot/`)
 Always-on Discord bot deployed to AWS Fargate. Monitors product and dev channels for user interactions.
 - Auto-deploys on push to `main` when `tools/discord-product-bot/**` changes
+- Uses S3 for issue attachments (images from Discord messages) - requires `S3_ATTACHMENTS_BUCKET` env var
 - See `tools/discord-product-bot/README.md` for deployment setup
 
 ### Business Bot (`tools/business-bot/`)
@@ -183,6 +190,22 @@ MCP server that gives agents the ability to post updates to Discord during pipel
 - Agents use `discord_post_dev_update` tool for status updates
 - Categories: `tech_debt`, `progress`, `delay`, `thinking`
 - See `tools/mcp-discord/README.md` for details
+
+### MCP Clarification (`tools/mcp-clarification/`)
+MCP server that allows agents to request clarification from humans when blocked.
+- Built and loaded automatically in `agent-step.yml`
+- Agents use `request_clarification` tool when missing info (API keys, ambiguous requirements, etc.)
+- Posts comment on issue tagging team lead, polls for response (30 min default)
+- If no response in time, saves checkpoint and pauses workflow
+- `clarification-response.yml` workflow resumes pipeline when human responds
+- See `tools/mcp-clarification/README.md` for details
+
+### Clarification Response Handler (`clarification-response.yml`)
+Listens for issue comments on issues with `needs-clarification` label.
+- Detects responses to clarification requests
+- Downloads checkpoint artifact with saved state
+- Re-triggers issue-pipeline in resume mode
+- Skips already-completed agents, passes clarification to blocked agent
 
 ### Issue Discord Relay (`.github/workflows/issue-discord-relay.yml`)
 Monitors issue and comment events, uses GPT-4o to generate friendly #dev channel updates.

@@ -114,12 +114,16 @@ export async function configurePipelineSecrets(
     discordDevWebhookUrl?: string;
     discordProductWebhookUrl?: string;
     openaiApiKey?: string;
+    // E2E Testing
+    discordE2eWebhookUrl?: string;
   },
   variables: {
     discordProductChannelId?: string;
     discordDevChannelId?: string;
     discordPrChannelId?: string;
     discordTeamLeadUserId?: string;
+    // E2E Testing
+    appPublicDomain?: string;
   },
   hasApproval = false
 ): Promise<ToolResult> {
@@ -164,12 +168,16 @@ export async function configurePipelineSecrets(
         DISCORD_DEV_WEBHOOK_URL: secrets.discordDevWebhookUrl,
         DISCORD_PRODUCT_WEBHOOK_URL: secrets.discordProductWebhookUrl,
         OPENAI_API_KEY: secrets.openaiApiKey,
+        // E2E Testing
+        DISCORD_E2E_WEBHOOK_URL: secrets.discordE2eWebhookUrl,
       },
       {
         DISCORD_PRODUCT_CHANNEL_ID: variables.discordProductChannelId,
         DISCORD_DEV_CHANNEL_ID: variables.discordDevChannelId,
         DISCORD_PR_CHANNEL_ID: variables.discordPrChannelId,
         DISCORD_TEAM_LEAD_USER_ID: variables.discordTeamLeadUserId,
+        // E2E Testing
+        APP_PUBLIC_DOMAIN: variables.appPublicDomain,
       }
     );
 
@@ -245,4 +253,156 @@ export async function configureFromDiscordServer(
     {},
     hasApproval
   );
+}
+
+export async function scaffoldRepoFromTemplate(
+  projectId: string,
+  secretValues: Record<string, string>
+): Promise<ToolResult> {
+  const project = projectStore.getProject(projectId);
+  if (!project) {
+    return {
+      success: false,
+      error: `Project ${projectId} not found`,
+    };
+  }
+
+  if (!project.resources.github) {
+    return {
+      success: false,
+      error: 'Project does not have a GitHub repository configured',
+    };
+  }
+
+  const { owner, repo } = project.resources.github;
+
+  const enrichedSecretValues = { ...secretValues };
+  const autoVariables: Record<string, string> = {};
+
+  if (project.resources.discord) {
+    const { webhooks, channelIds } = project.resources.discord;
+
+    if (webhooks) {
+      if (webhooks['dev'] && !enrichedSecretValues['DISCORD_DEV_WEBHOOK_URL']) {
+        enrichedSecretValues['DISCORD_DEV_WEBHOOK_URL'] = webhooks['dev'];
+      }
+      if (webhooks['product'] && !enrichedSecretValues['DISCORD_PRODUCT_WEBHOOK_URL']) {
+        enrichedSecretValues['DISCORD_PRODUCT_WEBHOOK_URL'] = webhooks['product'];
+      }
+      if (webhooks['pull-requests'] && !enrichedSecretValues['DISCORD_PR_WEBHOOK_URL']) {
+        enrichedSecretValues['DISCORD_PR_WEBHOOK_URL'] = webhooks['pull-requests'];
+      }
+    }
+
+    if (channelIds) {
+      if (channelIds['dev']) {
+        autoVariables['DISCORD_DEV_CHANNEL_ID'] = channelIds['dev'];
+      }
+      if (channelIds['product']) {
+        autoVariables['DISCORD_PRODUCT_CHANNEL_ID'] = channelIds['product'];
+      }
+      if (channelIds['pull-requests']) {
+        autoVariables['DISCORD_PR_CHANNEL_ID'] = channelIds['pull-requests'];
+      }
+    }
+  }
+
+  const templateFull = config.github.templateRepo;
+  const [templateOwner, templateRepo] = templateFull.split('/');
+
+  try {
+    const result = await github.scaffoldRepoSecretsAndVariables(
+      owner,
+      repo,
+      templateOwner,
+      templateRepo,
+      enrichedSecretValues
+    );
+
+    for (const [name, value] of Object.entries(autoVariables)) {
+      const success = await github.setRepositoryVariable(owner, repo, name, value);
+      if (success) {
+        result.variablesSet.push(name);
+      } else {
+        result.errors.push(`Failed to set variable: ${name}`);
+      }
+    }
+
+    const discordSecretsProvided = [
+      'DISCORD_DEV_WEBHOOK_URL',
+      'DISCORD_PRODUCT_WEBHOOK_URL',
+      'DISCORD_PR_WEBHOOK_URL',
+    ].filter((s) => enrichedSecretValues[s]);
+
+    if (result.missingSecrets.length > 0) {
+      return {
+        success: true,
+        data: {
+          owner,
+          repo,
+          secretsSet: result.secretsSet,
+          variablesSet: result.variablesSet,
+          missingSecrets: result.missingSecrets,
+          errors: result.errors,
+          discordAutoConfigured: discordSecretsProvided.length > 0,
+          discordSecretsProvided,
+          needsSecrets: true,
+          message:
+            `Scaffolded ${result.secretsSet.length} secrets and ${result.variablesSet.length} variables. ` +
+            (discordSecretsProvided.length > 0
+              ? `Discord webhooks auto-configured from project. `
+              : '') +
+            `Missing secrets that need values: ${result.missingSecrets.join(', ')}`,
+        },
+      };
+    }
+
+    return {
+      success: result.errors.length === 0,
+      data: {
+        owner,
+        repo,
+        secretsSet: result.secretsSet,
+        variablesSet: result.variablesSet,
+        errors: result.errors,
+        discordAutoConfigured: discordSecretsProvided.length > 0,
+        discordSecretsProvided,
+        message:
+          `Scaffolded ${result.secretsSet.length} secrets and ${result.variablesSet.length} variables for ${owner}/${repo}` +
+          (discordSecretsProvided.length > 0
+            ? `. Discord webhooks and channel IDs auto-configured from project.`
+            : ''),
+      },
+      error: result.errors.length > 0 ? `Some configurations failed: ${result.errors.join(', ')}` : undefined,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to scaffold repository configuration',
+    };
+  }
+}
+
+export async function getTemplateConfig(): Promise<ToolResult> {
+  const templateFull = config.github.templateRepo;
+  const [templateOwner, templateRepo] = templateFull.split('/');
+
+  try {
+    const templateConfig = await github.getTemplateRepoConfig(templateOwner, templateRepo);
+
+    return {
+      success: true,
+      data: {
+        templateRepo: templateFull,
+        secrets: templateConfig.secrets,
+        variables: templateConfig.variables,
+        summary: `Template has ${templateConfig.secrets.length} secrets and ${templateConfig.variables.length} variables`,
+      },
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to get template configuration',
+    };
+  }
 }

@@ -276,7 +276,7 @@ jobs:
     uses: ./.github/workflows/discord-gpt-message.yml
     with:
       webhook_username: "Riley - Docs"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=RileyDocs"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=RileyDocs1"
       prompt: |
         📚 documentation drift detected this week
 

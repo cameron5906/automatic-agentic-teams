@@ -221,6 +221,8 @@ export function setDiscordResource(
     serverName: string;
     inviteUrl?: string;
     channels?: string[];
+    channelIds?: Record<string, string>;
+    webhooks?: Record<string, string>;
   }
 ): Project | null {
   const project = getProject(projectId);
@@ -234,6 +236,8 @@ export function setDiscordResource(
         serverName: discord.serverName,
         inviteUrl: discord.inviteUrl,
         channels: discord.channels ?? [],
+        channelIds: discord.channelIds,
+        webhooks: discord.webhooks,
       },
     },
   });

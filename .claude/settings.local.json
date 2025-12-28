@@ -8,7 +8,11 @@
       "Bash(git add:*)",
       "Bash(git commit:*)",
       "Bash(git checkout:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(dir /s /b C:UserscamerDocumentsProjectsgithub-auto-teamtoolsdiscord-product-botsrc)",
+      "Bash(npm test:*)",
+      "Bash(npx yaml-lint:*)",
+      "Bash(npm install)"
     ]
   }
 }

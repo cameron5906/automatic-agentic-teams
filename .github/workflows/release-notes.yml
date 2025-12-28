@@ -327,7 +327,7 @@ jobs:
     uses: ./.github/workflows/discord-gpt-message.yml
     with:
       webhook_username: "Jordan - PM"
-      webhook_avatar_url: "https://api.dicebear.com/9.x/bottts/png?seed=JordanPM"
+      webhook_avatar_url: "https://api.dicebear.com/9.x/personas/png?seed=JordanPM1"
       prompt: |
         🚀 new release: ${{ needs.collect-changes.outputs.current_tag }}
 

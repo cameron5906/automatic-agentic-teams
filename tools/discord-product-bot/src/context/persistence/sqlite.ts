@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import type { ConversationMessage } from '../../types.js';
+import type { DraftIssue } from '../../ticket-flows/types.js';
 
 /**
  * SQLite persistence for bot state.
@@ -27,6 +28,12 @@ export interface SqliteStateStore {
     upsertBotThread(threadId: string, lastActivity: number): void;
     loadBotThreads(params: { sinceTimestamp: number; limit: number }): string[];
     pruneBotThreads(beforeTimestamp: number): number;
+
+    // Draft issues
+    upsertDraft(draft: DraftIssue): void;
+    loadDrafts(params: { sinceTimestamp: number; limit: number }): DraftIssue[];
+    deleteDraft(threadId: string): void;
+    pruneDrafts(beforeTimestamp: number): number;
 }
 
 function ensureParentDir(filePath: string): void {
@@ -61,6 +68,31 @@ function migrate(db: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_bot_threads_last_activity
       ON bot_threads(last_activity);
+
+    CREATE TABLE IF NOT EXISTS draft_issues (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL UNIQUE,
+      channel_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      fields_json TEXT NOT NULL,
+      collected_fields_json TEXT NOT NULL,
+      draft_message_id TEXT NULL,
+      status TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      created_by TEXT NOT NULL,
+      filed_issue_number INTEGER NULL,
+      filed_issue_url TEXT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_draft_issues_thread_id
+      ON draft_issues(thread_id);
+
+    CREATE INDEX IF NOT EXISTS idx_draft_issues_updated_at
+      ON draft_issues(updated_at);
+
+    CREATE INDEX IF NOT EXISTS idx_draft_issues_status
+      ON draft_issues(status);
   `);
 }
 
@@ -130,6 +162,46 @@ export function initSqliteStateStore(sqlitePath: string): SqliteStateStore {
     const pruneBotThreadsStmt = db.prepare(`
     DELETE FROM bot_threads
     WHERE last_activity < @before
+  `);
+
+    const upsertDraftStmt = db.prepare(`
+    INSERT INTO draft_issues (
+      id, thread_id, channel_id, type, fields_json, collected_fields_json,
+      draft_message_id, status, created_at, updated_at, created_by,
+      filed_issue_number, filed_issue_url
+    ) VALUES (
+      @id, @thread_id, @channel_id, @type, @fields_json, @collected_fields_json,
+      @draft_message_id, @status, @created_at, @updated_at, @created_by,
+      @filed_issue_number, @filed_issue_url
+    )
+    ON CONFLICT(thread_id) DO UPDATE SET
+      fields_json = excluded.fields_json,
+      collected_fields_json = excluded.collected_fields_json,
+      draft_message_id = excluded.draft_message_id,
+      status = excluded.status,
+      updated_at = excluded.updated_at,
+      filed_issue_number = excluded.filed_issue_number,
+      filed_issue_url = excluded.filed_issue_url
+  `);
+
+    const selectDraftsStmt = db.prepare(`
+    SELECT id, thread_id, channel_id, type, fields_json, collected_fields_json,
+           draft_message_id, status, created_at, updated_at, created_by,
+           filed_issue_number, filed_issue_url
+    FROM draft_issues
+    WHERE updated_at >= @since
+    ORDER BY updated_at DESC
+    LIMIT @limit
+  `);
+
+    const deleteDraftStmt = db.prepare(`
+    DELETE FROM draft_issues
+    WHERE thread_id = @thread_id
+  `);
+
+    const pruneDraftsStmt = db.prepare(`
+    DELETE FROM draft_issues
+    WHERE updated_at < @before AND status IN ('filed', 'cancelled')
   `);
 
     return {
@@ -206,6 +278,70 @@ export function initSqliteStateStore(sqlitePath: string): SqliteStateStore {
 
         pruneBotThreads(beforeTimestamp) {
             const info = pruneBotThreadsStmt.run({ before: beforeTimestamp });
+            return Number(info.changes ?? 0);
+        },
+
+        upsertDraft(draft) {
+            upsertDraftStmt.run({
+                id: draft.id,
+                thread_id: draft.threadId,
+                channel_id: draft.channelId,
+                type: draft.type,
+                fields_json: JSON.stringify(draft.fields),
+                collected_fields_json: JSON.stringify(draft.collectedFields),
+                draft_message_id: draft.draftMessageId,
+                status: draft.status,
+                created_at: draft.createdAt,
+                updated_at: draft.updatedAt,
+                created_by: draft.createdBy,
+                filed_issue_number: draft.filedIssueNumber ?? null,
+                filed_issue_url: draft.filedIssueUrl ?? null,
+            });
+        },
+
+        loadDrafts({ sinceTimestamp, limit }) {
+            const rows = selectDraftsStmt.all({
+                since: sinceTimestamp,
+                limit,
+            }) as Array<{
+                id: string;
+                thread_id: string;
+                channel_id: string;
+                type: string;
+                fields_json: string;
+                collected_fields_json: string;
+                draft_message_id: string | null;
+                status: string;
+                created_at: number;
+                updated_at: number;
+                created_by: string;
+                filed_issue_number: number | null;
+                filed_issue_url: string | null;
+            }>;
+
+            return rows.map((row) => ({
+                id: row.id,
+                threadId: row.thread_id,
+                channelId: row.channel_id,
+                type: row.type as DraftIssue['type'],
+                fields: JSON.parse(row.fields_json),
+                collectedFields: JSON.parse(row.collected_fields_json),
+                draftMessageId: row.draft_message_id,
+                status: row.status as DraftIssue['status'],
+                createdAt: row.created_at,
+                updatedAt: row.updated_at,
+                createdBy: row.created_by,
+                filedIssueNumber: row.filed_issue_number ?? undefined,
+                filedIssueUrl: row.filed_issue_url ?? undefined,
+            }));
+        },
+
+        deleteDraft(threadId) {
+            deleteDraftStmt.run({ thread_id: threadId });
+        },
+
+        pruneDrafts(beforeTimestamp) {
+            const info = pruneDraftsStmt.run({ before: beforeTimestamp });
             return Number(info.changes ?? 0);
         },
     };
