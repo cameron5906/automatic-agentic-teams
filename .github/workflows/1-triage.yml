@@ -226,6 +226,15 @@ jobs:
           RESULT_BASE64: ${{ needs.triage.outputs.result }}
         with:
           script: |
+            // Debug output chain - helps diagnose reusable workflow output issues
+            console.log('=== OUTPUT CHAIN DEBUG ===');
+            console.log('RESULT_BASE64 exists:', !!process.env.RESULT_BASE64);
+            console.log('RESULT_BASE64 length:', (process.env.RESULT_BASE64 || '').length);
+            if (process.env.RESULT_BASE64) {
+              console.log('First 100 chars:', process.env.RESULT_BASE64.substring(0, 100));
+            }
+            console.log('===========================');
+
             // Decode base64 result from agent-runner
             const base64Result = process.env.RESULT_BASE64 || '';
             let resultJson = '';
@@ -291,19 +300,21 @@ jobs:
   # ============================================================================
   handle-decision:
     name: Handle Decision
-    needs: [should-run, parse-triage]
+    needs: [should-run, triage, parse-triage]
     runs-on: ubuntu-latest
     steps:
       - name: Apply labels based on decision
         uses: actions/github-script@v7
         env:
           SUMMARY: ${{ needs.parse-triage.outputs.summary }}
+          RESULT_BASE64: ${{ needs.triage.outputs.result }}
         with:
           github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
           script: |
             const issueNumber = ${{ needs.should-run.outputs.issue_number }};
             const decision = '${{ needs.parse-triage.outputs.decision }}';
             const summary = process.env.SUMMARY || '';
+            const base64Len = (process.env.RESULT_BASE64 || '').length;
 
             console.log(`Applying decision: ${decision}`);
             console.log(`Summary: ${summary}`);
@@ -352,12 +363,30 @@ jobs:
             } else {
               // Handle unknown/unparseable decision - don't fail silently
               console.log('Unknown decision, requesting human review');
+              console.log('Debug - base64 output length received:', base64Len);
+
+              const outputReceived = base64Len > 0;
+              const likelyCause = !outputReceived
+                ? '\n**Likely cause:** GitHub Actions reusable workflow output bug. The agent completed successfully but the output did not propagate. See workflow logs for more details.\n'
+                : '';
+
+              const errorBody = [
+                '⚠️ **Triage Error** - Could not determine decision from agent output.',
+                '',
+                '**Debug Info:**',
+                '- Reusable workflow output length: ' + base64Len + ' chars',
+                '- Output received: ' + (outputReceived ? 'Yes' : '**NO - OUTPUT CHAIN BROKEN**'),
+                '- Decision parsed: `' + decision + '`',
+                '- Summary: ' + (summary || 'none'),
+                likelyCause,
+                'Please manually review and add `v2:phase:planning` label to continue, or close the issue if rejected.'
+              ].join('\n');
 
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: issueNumber,
-                body: `⚠️ **Triage Error** - Could not determine decision from agent output.\n\n**Decision parsed:** \`${decision}\`\n**Summary:** ${summary || 'none'}\n\nPlease manually review and add \`v2:phase:planning\` label to continue, or close the issue if rejected.`
+                body: errorBody
               });
 
               await github.rest.issues.addLabels({

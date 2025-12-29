@@ -48,10 +48,13 @@ on:
     outputs:
       result:
         description: "Agent execution result (JSON)"
-        value: ${{ jobs.run-agent.outputs.result }}
+        # NOTE: Using fromJSON(toJSON()) workaround for GitHub Actions bug where
+        # reusable workflow outputs sometimes resolve to empty strings.
+        # See: https://github.com/actions/runner/issues/2495
+        value: ${{ fromJSON(toJSON(jobs.run-agent)).outputs.result }}
       success:
         description: "Whether agent succeeded"
-        value: ${{ jobs.run-agent.outputs.success }}
+        value: ${{ fromJSON(toJSON(jobs.run-agent)).outputs.success }}
     secrets:
       CLAUDE_WORKFLOW_TOKEN:
         required: true
@@ -532,7 +535,8 @@ jobs:
           done
 
           if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
-            echo "::warning::Push failed after $MAX_RETRIES attempts"
+            echo "::error::Push failed after $MAX_RETRIES attempts - agent changes may be lost"
+            exit 1
           fi
 
       - name: Parse agent output
