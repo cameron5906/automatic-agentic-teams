@@ -1,0 +1,319 @@
+# V2 Feedback Loop Workflow - Handles review rejections and fix iterations
+# Triggers: v2:fix-iteration-* or v2:acceptance-failed labels
+
+name: "V2: Feedback Loop"
+
+on:
+  issues:
+    types: [labeled]
+
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number"
+        required: true
+        type: string
+
+concurrency:
+  group: v2-feedback-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  # Required for claude-code-action OIDC token requests
+  id-token: write
+
+jobs:
+  # ============================================================================
+  # Check if we should run
+  # ============================================================================
+  should-run:
+    name: Check Trigger
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'labeled' && (
+        startsWith(github.event.label.name, 'v2:fix-iteration-') ||
+        github.event.label.name == 'v2:acceptance-failed'
+      ))
+    outputs:
+      issue_number: ${{ steps.check.outputs.issue_number }}
+      work_branch: ${{ steps.check.outputs.work_branch }}
+      pr_number: ${{ steps.check.outputs.pr_number }}
+      iteration: ${{ steps.check.outputs.iteration }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      - name: Get issue and iteration info
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            let issueNumber;
+            if (context.eventName === 'workflow_dispatch') {
+              issueNumber = ${{ inputs.issue_number || 0 }};
+            } else {
+              issueNumber = context.payload.issue.number;
+            }
+
+            core.setOutput('issue_number', issueNumber);
+
+            // Get issue labels
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber
+            });
+
+            // Determine iteration number and reason
+            let iteration = 1;
+            let reason = 'tech-review';
+
+            for (const label of issue.labels) {
+              const name = typeof label === 'string' ? label : label.name;
+
+              if (name === 'v2:acceptance-failed') {
+                reason = 'acceptance-failed';
+              }
+
+              const match = name.match(/^v2:fix-iteration-(\d+)$/);
+              if (match) {
+                iteration = parseInt(match[1], 10);
+              }
+            }
+
+            core.setOutput('iteration', iteration);
+            core.setOutput('reason', reason);
+
+            // Find PR for this issue
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
+            });
+
+            const pr = prs.find(p =>
+              p.body && p.body.includes(`#${issueNumber}`)
+            );
+
+            if (pr) {
+              core.setOutput('pr_number', pr.number);
+              core.setOutput('work_branch', pr.head.ref);
+              console.log('Found PR:', pr.number, 'Branch:', pr.head.ref);
+            } else {
+              core.setOutput('pr_number', '');
+              core.setOutput('work_branch', '');
+              console.log('No PR found for issue', issueNumber);
+            }
+
+  # ============================================================================
+  # Check iteration limit
+  # ============================================================================
+  check-iteration-limit:
+    name: Check Iteration Limit
+    needs: should-run
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - name: Check if we've exceeded iteration limit
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const iteration = ${{ needs.should-run.outputs.iteration }};
+            const maxIterations = 3;
+
+            if (iteration > maxIterations) {
+              console.log(`Iteration ${iteration} exceeds max ${maxIterations}`);
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: ${{ needs.should-run.outputs.issue_number }},
+                body: `⛔ **Fix iteration limit reached (${maxIterations})**\n\nThis issue has gone through ${iteration} fix iterations without resolution. Human intervention required.\n\n@${{ vars.TEAM_LEAD_USERNAME }} - Please review and provide guidance.`
+              });
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: ${{ needs.should-run.outputs.issue_number }},
+                labels: ['needs-human-review']
+              });
+
+              core.setOutput('proceed', 'false');
+            } else {
+              core.setOutput('proceed', 'true');
+            }
+
+  # ============================================================================
+  # Full-Stack Engineer Fix
+  # ============================================================================
+  engineer-fix:
+    name: Full-Stack Engineer - Fix
+    needs: [should-run, check-iteration-limit]
+    if: needs.check-iteration-limit.outputs.proceed == 'true'
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: full-stack-engineer
+      phase: fix
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        Fix iteration ${{ needs.should-run.outputs.iteration }} for issue #${{ needs.should-run.outputs.issue_number }}.
+
+        Reason for fix: ${{ needs.should-run.outputs.reason }}
+
+        Your task:
+        1. Read the issue context file for specific feedback
+        2. Read the PR review comments if applicable
+        3. Address each piece of feedback systematically
+        4. Run tests to verify fixes
+        5. Update the issue context file with what you changed
+        6. Commit your changes
+
+        This is iteration ${{ needs.should-run.outputs.iteration }} of 3 max.
+        Focus on the specific feedback - don't add unrelated changes.
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # QA Engineer Re-Validation
+  # ============================================================================
+  qa-revalidation:
+    name: QA Engineer - Re-Validation
+    needs: [should-run, engineer-fix]
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: qa-engineer
+      phase: fix
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        Re-validation after fix iteration ${{ needs.should-run.outputs.iteration }} for issue #${{ needs.should-run.outputs.issue_number }}.
+
+        Your task:
+        1. Read the issue context file for what was fixed
+        2. Run all tests - verify they pass
+        3. Check that the specific feedback has been addressed
+        4. Update the issue context file with validation result
+
+        If validation passes, set next_phase_ready to true.
+        If it fails, document what still needs work.
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Parse QA result
+  # ============================================================================
+  parse-qa:
+    name: Parse QA Result
+    needs: [should-run, qa-revalidation]
+    runs-on: ubuntu-latest
+    outputs:
+      success: ${{ steps.parse.outputs.success }}
+    steps:
+      - name: Parse validation result
+        id: parse
+        uses: actions/github-script@v7
+        env:
+          RESULT_BASE64: ${{ needs.qa-revalidation.outputs.result }}
+        with:
+          script: |
+            // Decode base64 result from agent-runner
+            const base64Result = process.env.RESULT_BASE64 || '';
+            let resultJson = '';
+            if (base64Result) {
+              try {
+                resultJson = Buffer.from(base64Result, 'base64').toString('utf8');
+              } catch (e) {
+                console.log('Failed to decode base64:', e.message);
+                resultJson = base64Result;
+              }
+            }
+
+            let result;
+            try {
+              result = JSON.parse(resultJson || '{}');
+            } catch (e) {
+              result = { next_phase_ready: false };
+            }
+            // Output as string 'true' or 'false' for proper conditional comparison
+            core.setOutput('success', String(result.next_phase_ready === true));
+
+  # ============================================================================
+  # Route back to review or increment iteration
+  # ============================================================================
+  route-result:
+    name: Route Result
+    needs: [should-run, parse-qa]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Route based on validation result
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const issueNumber = ${{ needs.should-run.outputs.issue_number }};
+            const success = '${{ needs.parse-qa.outputs.success }}' === 'true';
+            const currentIteration = ${{ needs.should-run.outputs.iteration }};
+            const reason = '${{ needs.should-run.outputs.reason }}';
+
+            // Remove current iteration label
+            const labelsToRemove = [
+              `v2:fix-iteration-${currentIteration}`,
+              'v2:acceptance-failed'
+            ];
+
+            for (const label of labelsToRemove) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  name: label
+                });
+              } catch (e) {}
+            }
+
+            if (success) {
+              // Route back to review
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: ['v2:phase:review']
+              });
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: `✅ **Fix Iteration ${currentIteration} Complete**\n\nFixes verified. Routing back to review.`
+              });
+            } else {
+              // Increment iteration and notify
+              const nextIteration = currentIteration + 1;
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: [`v2:fix-iteration-${nextIteration}`]
+              });
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: `⚠️ **Fix Iteration ${currentIteration} Incomplete**\n\nValidation failed. Starting iteration ${nextIteration}.`
+              });
+            }
+

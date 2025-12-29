@@ -1,0 +1,640 @@
+# V2 Agent Runner - Reusable workflow for executing agents
+# Loads configuration from automated/agents/team.json
+
+name: V2 Agent Runner
+
+on:
+  workflow_call:
+    inputs:
+      agent_name:
+        description: "Agent identifier (e.g., 'tech-lead', 'full-stack-engineer')"
+        required: true
+        type: string
+      phase:
+        description: "Phase to execute (e.g., 'planning', 'dev', 'review')"
+        required: true
+        type: string
+      issue_number:
+        description: "GitHub issue number"
+        required: true
+        # NOTE: Keep this as a string. Callers commonly pass `needs.<job>.outputs.issue_number`,
+        # and job outputs are always strings even if they look numeric (e.g. "101").
+        # Declaring this as `number` causes "Unexpected value '101'" and prevents the reusable
+        # workflow job from being created.
+        type: string
+      work_branch:
+        description: "Git branch for this work"
+        required: true
+        type: string
+      task_prompt:
+        description: "Specific task prompt for this agent"
+        required: true
+        type: string
+      context:
+        description: "Additional context (JSON string)"
+        required: false
+        type: string
+        default: "{}"
+      is_resume:
+        description: "Whether this is resuming after clarification"
+        required: false
+        type: boolean
+        default: false
+      clarification_response:
+        description: "Human response to clarification request"
+        required: false
+        type: string
+        default: ""
+    outputs:
+      result:
+        description: "Agent execution result (JSON)"
+        value: ${{ jobs.run-agent.outputs.result }}
+      success:
+        description: "Whether agent succeeded"
+        value: ${{ jobs.run-agent.outputs.success }}
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN:
+        required: true
+      ANTHROPIC_API_KEY:
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      DISCORD_DEV_WEBHOOK_URL:
+        required: true
+      OPENAI_API_KEY:
+        required: false
+
+env:
+  TEAM_CONFIG_PATH: automated/agents/team.json
+  DEFINITIONS_PATH: automated/agents/definitions
+  MEMORY_PATH: automated/agents/memory
+  ISSUES_PATH: automated/shared/issues
+
+jobs:
+  run-agent:
+    name: "Run ${{ inputs.agent_name }} (${{ inputs.phase }})"
+    runs-on: ubuntu-latest
+    permissions:
+      # Required by claude-code-action to request an OIDC token. Without this, GitHub will not
+      # provide ACTIONS_ID_TOKEN_REQUEST_URL and the action fails early.
+      id-token: write
+    # GitHub-native timeout for the entire agent run (claude-code-action does not support timeout_minutes input)
+    timeout-minutes: 60
+    outputs:
+      result: ${{ steps.parse-output.outputs.result }}
+      success: ${{ steps.parse-output.outputs.success }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.work_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          # Ensure the checkout writes credentials for subsequent `git push` steps.
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Load team configuration
+        id: config
+        run: |
+          set -euo pipefail
+
+          # Read team.json
+          TEAM_JSON=$(cat "${{ env.TEAM_CONFIG_PATH }}")
+
+          # Get agent config
+          AGENT_CONFIG=$(echo "$TEAM_JSON" | jq -r ".team[\"${{ inputs.agent_name }}\"]")
+
+          if [ "$AGENT_CONFIG" = "null" ]; then
+            echo "::error::Agent '${{ inputs.agent_name }}' not found in team.json"
+            exit 1
+          fi
+
+          # Get phase-specific definition file
+          PHASE_FILE=$(echo "$AGENT_CONFIG" | jq -r ".phases[\"${{ inputs.phase }}\"]")
+
+          if [ "$PHASE_FILE" = "null" ]; then
+            echo "::error::Phase '${{ inputs.phase }}' not found for agent '${{ inputs.agent_name }}'"
+            exit 1
+          fi
+
+          DEFINITION_PATH="${{ env.DEFINITIONS_PATH }}/${PHASE_FILE}"
+
+          if [ ! -f "$DEFINITION_PATH" ]; then
+            echo "::error::Definition file not found: $DEFINITION_PATH"
+            exit 1
+          fi
+
+          # Get agent display info
+          AGENT_NAME=$(echo "$AGENT_CONFIG" | jq -r ".name")
+          AGENT_FULL_NAME=$(echo "$AGENT_CONFIG" | jq -r ".fullName")
+          AGENT_AVATAR=$(echo "$AGENT_CONFIG" | jq -r ".avatar")
+          AGENT_EMOJI=$(echo "$AGENT_CONFIG" | jq -r ".discord.emoji")
+
+          # Get write permissions
+          CAN_WRITE=$(echo "$AGENT_CONFIG" | jq -c ".canWrite // []")
+          CANNOT_WRITE=$(echo "$AGENT_CONFIG" | jq -c ".cannotWrite // []")
+
+          # Get label config
+          LABELS_CONFIG=$(echo "$TEAM_JSON" | jq -c ".labels")
+
+          # Output
+          echo "definition_path=$DEFINITION_PATH" >> "$GITHUB_OUTPUT"
+          echo "agent_name=$AGENT_NAME" >> "$GITHUB_OUTPUT"
+          echo "agent_full_name=$AGENT_FULL_NAME" >> "$GITHUB_OUTPUT"
+          echo "agent_avatar=$AGENT_AVATAR" >> "$GITHUB_OUTPUT"
+          echo "agent_emoji=$AGENT_EMOJI" >> "$GITHUB_OUTPUT"
+          echo "can_write=$CAN_WRITE" >> "$GITHUB_OUTPUT"
+          echo "cannot_write=$CANNOT_WRITE" >> "$GITHUB_OUTPUT"
+          echo "labels_config=$LABELS_CONFIG" >> "$GITHUB_OUTPUT"
+
+          echo "Loaded config for $AGENT_FULL_NAME, phase: ${{ inputs.phase }}"
+          echo "Definition: $DEFINITION_PATH"
+
+      - name: Find issue context file
+        id: issue-context
+        run: |
+          set -euo pipefail
+
+          # Find issue context file matching the issue number
+          ISSUE_FILE=$(find "${{ env.ISSUES_PATH }}" -name "${{ inputs.issue_number }}-*.md" -type f 2>/dev/null | head -1)
+
+          if [ -n "$ISSUE_FILE" ]; then
+            echo "issue_file=$ISSUE_FILE" >> "$GITHUB_OUTPUT"
+            echo "Found issue context: $ISSUE_FILE"
+          else
+            echo "issue_file=" >> "$GITHUB_OUTPUT"
+            echo "No issue context file found for #${{ inputs.issue_number }}"
+          fi
+
+      - name: Load agent memory
+        id: memory
+        run: |
+          set -euo pipefail
+
+          MEMORY_FILE="${{ env.MEMORY_PATH }}/${{ inputs.agent_name }}/MEMORY.md"
+
+          if [ -f "$MEMORY_FILE" ]; then
+            echo "memory_file=$MEMORY_FILE" >> "$GITHUB_OUTPUT"
+            echo "Found memory file: $MEMORY_FILE"
+          else
+            echo "memory_file=" >> "$GITHUB_OUTPUT"
+            echo "No memory file found"
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build MCP Discord
+        working-directory: tools/mcp-discord
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build MCP Clarification
+        if: hashFiles('tools/mcp-clarification/package.json') != ''
+        working-directory: tools/mcp-clarification
+        run: |
+          npm ci
+          npm run build
+
+      - name: Create MCP configuration
+        run: |
+          set -euo pipefail
+
+          ISSUE_URL="https://github.com/${{ github.repository }}/issues/${{ inputs.issue_number }}"
+
+          cat > /tmp/mcp-config.json << EOF
+          {
+            "mcpServers": {
+              "discord": {
+                "command": "node",
+                "args": ["${{ github.workspace }}/tools/mcp-discord/dist/index.js"],
+                "env": {
+                  "DISCORD_WEBHOOK_URL": "${{ secrets.DISCORD_DEV_WEBHOOK_URL }}",
+                  "AGENT_NAME": "${{ steps.config.outputs.agent_full_name }}",
+                  "ISSUE_NUMBER": "${{ inputs.issue_number }}",
+                  "ISSUE_URL": "${ISSUE_URL}",
+                  "MESSAGE_PREFIX": "[#${{ inputs.issue_number }}](${ISSUE_URL})"
+                }
+              },
+              "clarification": {
+                "command": "node",
+                "args": ["${{ github.workspace }}/tools/mcp-clarification/dist/index.js"],
+                "env": {
+                  "GITHUB_TOKEN": "${{ secrets.CLAUDE_WORKFLOW_TOKEN }}",
+                  "GITHUB_REPOSITORY": "${{ github.repository }}",
+                  "ISSUE_NUMBER": "${{ inputs.issue_number }}",
+                  "TEAM_LEAD_USERNAME": "${{ vars.TEAM_LEAD_USERNAME }}",
+                  "AGENT_NAME": "${{ steps.config.outputs.agent_full_name }}"
+                }
+              }
+            }
+          }
+          EOF
+
+          echo "MCP configuration created"
+
+      - name: Build system prompt
+        id: prompt
+        run: |
+          set -euo pipefail
+
+          # Read definition file
+          DEFINITION=$(cat "${{ steps.config.outputs.definition_path }}")
+
+          # Read memory if exists
+          MEMORY=""
+          if [ -n "${{ steps.memory.outputs.memory_file }}" ]; then
+            MEMORY=$(cat "${{ steps.memory.outputs.memory_file }}")
+          fi
+
+          # Read issue context if exists
+          ISSUE_CONTEXT=""
+          if [ -n "${{ steps.issue-context.outputs.issue_file }}" ]; then
+            ISSUE_CONTEXT=$(cat "${{ steps.issue-context.outputs.issue_file }}")
+          fi
+
+          # Build system prompt
+          cat > /tmp/system_prompt.txt << 'SYSPROMPT'
+          # Agent Execution Context
+
+          ## Agent
+          - **Name:** ${{ steps.config.outputs.agent_full_name }}
+          - **Phase:** ${{ inputs.phase }}
+          - **Issue:** #${{ inputs.issue_number }}
+          - **Branch:** ${{ inputs.work_branch }}
+
+          ---
+
+          ## REQUIRED: #dev Status Updates (do this every run)
+
+          You MUST post Discord updates as you work using the MCP tool:
+          - Tool: `mcp__discord__discord_post_dev_update`
+          - Categories: `progress`, `thinking`, `delay`, `tech_debt`
+
+          Minimum required cadence (at least 3 updates per run):
+          1. **Start** (category: `progress`): what you’re about to do
+          2. **Milestone/transition** (category: `progress` or `thinking`): tests written, root cause found, fix implemented, validation started, etc.
+          3. **Complete** (category: `progress`): what changed + whether it’s ready for the next phase
+
+          If you get blocked, post a `delay` update before requesting clarification.
+          Keep messages short (1–2 sentences). Aim for ~3–6 updates per run (don’t spam).
+
+          SYSPROMPT
+
+          echo "$DEFINITION" >> /tmp/system_prompt.txt
+
+          if [ -n "$MEMORY" ]; then
+            echo "" >> /tmp/system_prompt.txt
+            echo "---" >> /tmp/system_prompt.txt
+            echo "" >> /tmp/system_prompt.txt
+            echo "## Your Memory" >> /tmp/system_prompt.txt
+            echo "" >> /tmp/system_prompt.txt
+            echo "$MEMORY" >> /tmp/system_prompt.txt
+          fi
+
+          if [ -n "$ISSUE_CONTEXT" ]; then
+            echo "" >> /tmp/system_prompt.txt
+            echo "---" >> /tmp/system_prompt.txt
+            echo "" >> /tmp/system_prompt.txt
+            echo "## Issue Context File" >> /tmp/system_prompt.txt
+            echo "" >> /tmp/system_prompt.txt
+            echo "Path: ${{ steps.issue-context.outputs.issue_file }}" >> /tmp/system_prompt.txt
+            echo "" >> /tmp/system_prompt.txt
+            echo "$ISSUE_CONTEXT" >> /tmp/system_prompt.txt
+          fi
+
+          # Add additional context if provided
+          ADDITIONAL_CONTEXT='${{ inputs.context }}'
+          if [ "$ADDITIONAL_CONTEXT" != "{}" ]; then
+            echo "" >> /tmp/system_prompt.txt
+            echo "---" >> /tmp/system_prompt.txt
+            echo "" >> /tmp/system_prompt.txt
+            echo "## Additional Context" >> /tmp/system_prompt.txt
+            echo "" >> /tmp/system_prompt.txt
+            echo "$ADDITIONAL_CONTEXT" >> /tmp/system_prompt.txt
+          fi
+
+          # Add clarification response if resuming
+          if [ "${{ inputs.is_resume }}" = "true" ] && [ -n "${{ inputs.clarification_response }}" ]; then
+            echo "" >> /tmp/system_prompt.txt
+            echo "---" >> /tmp/system_prompt.txt
+            echo "" >> /tmp/system_prompt.txt
+            echo "## IMPORTANT: Clarification Response" >> /tmp/system_prompt.txt
+            echo "" >> /tmp/system_prompt.txt
+            echo "You previously requested clarification. Here is the response:" >> /tmp/system_prompt.txt
+            echo "" >> /tmp/system_prompt.txt
+            echo "${{ inputs.clarification_response }}" >> /tmp/system_prompt.txt
+            echo "" >> /tmp/system_prompt.txt
+            echo "Continue your work with this information." >> /tmp/system_prompt.txt
+          fi
+
+          # Add MCP tool guidelines
+          cat >> /tmp/system_prompt.txt << 'MCPGUIDE'
+
+          ---
+
+          ## MCP Tools Available
+
+          ### mcp__discord__discord_post_dev_update
+          Post status updates to the #dev Discord channel.
+          - Input: `{ "category": "progress|delay|thinking|tech_debt", "message": "..." }`
+          - Messages are automatically prefixed with issue context (via MESSAGE_PREFIX)
+          - Use this multiple times per run (start / milestones / completion)
+
+          ### mcp__clarification__request_clarification
+          Request information from humans when blocked.
+          - Use when missing critical information
+          - Be specific about what you need
+          - Workflow will pause until response received
+
+          MCPGUIDE
+
+          echo "System prompt built ($(wc -l < /tmp/system_prompt.txt) lines)"
+
+      - name: Create output schema
+        id: schema
+        run: |
+          cat > /tmp/output_schema.json << 'SCHEMA'
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["success", "summary", "files_changed", "next_phase_ready"],
+            "properties": {
+              "success": {
+                "type": "boolean",
+                "description": "Whether the agent completed successfully"
+              },
+              "summary": {
+                "type": "string",
+                "description": "Brief summary of what was done"
+              },
+              "files_changed": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "List of files modified"
+              },
+              "commits_made": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "List of commit SHAs"
+              },
+              "next_phase_ready": {
+                "type": "boolean",
+                "description": "Whether work is ready for next phase"
+              },
+              "next_phase_label": {
+                "type": "string",
+                "description": "Label to add for next phase (if applicable)"
+              },
+              "blocking_issues": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Any blocking issues found"
+              },
+              "needs_agents": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Other agents that need to be involved"
+              },
+              "assignments": {
+                "type": "object",
+                "description": "Work assignments for other agents (Tech Lead only)"
+              },
+              "tech_debt_items": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Tech debt discovered during work"
+              },
+              "review_comment": {
+                "type": "string",
+                "description": "Review feedback comment (Tech Lead review phase)"
+              },
+              "pr_title": {
+                "type": "string",
+                "description": "PR title in conventional commit format (Tech Lead review phase)"
+              },
+              "pr_body": {
+                "type": "string",
+                "description": "PR body markdown with Summary, Changes, Testing sections (Tech Lead review phase)"
+              },
+              "suggestions": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Non-blocking suggestions for improvement"
+              }
+            }
+          }
+          SCHEMA
+
+          # Output the compact JSON string for the CLI arg (same as old agent-step.yml)
+          echo "content=$(jq -c . /tmp/output_schema.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Compose Claude prompt
+        id: compose-prompt
+        run: |
+          set -euo pipefail
+
+          # The user prompt is just the task + output instruction
+          # System context is loaded via --system-prompt-file
+          DELIM="PROMPT_EOF_$(openssl rand -hex 8)"
+          {
+            echo "prompt<<$DELIM"
+            echo "## Your Task"
+            echo ""
+            cat << 'TASK_EOF'
+          ${{ inputs.task_prompt }}
+          TASK_EOF
+            echo ""
+            echo "---"
+            echo ""
+            echo "When complete, output a JSON object matching the schema with your results."
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run agent
+        id: agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          github_token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --mcp-config /tmp/mcp-config.json
+            --model claude-opus-4-5-20251101
+            --json-schema '${{ steps.schema.outputs.content }}'
+            --max-turns 6000
+            --system-prompt-file /tmp/system_prompt.txt
+            --allowedTools "Edit,Glob,Grep,Read,Write,Bash(git:*),Bash(npm:*),Bash(npx:*),Bash(dotnet:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(rm:*),Bash(pwd),Bash(echo:*),mcp__discord__discord_post_dev_update,mcp__clarification__request_clarification"
+          prompt: ${{ steps.compose-prompt.outputs.prompt }}
+          show_full_output: true
+
+      - name: Auto-commit changes
+        if: always()
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "chore(${{ inputs.agent_name }}): ${{ inputs.phase }} phase for #${{ inputs.issue_number }}
+
+            Agent: ${{ steps.config.outputs.agent_full_name }}
+            Phase: ${{ inputs.phase }}
+
+            Refs: #${{ inputs.issue_number }}"
+
+            echo "Changes committed"
+          else
+            echo "No changes to commit"
+          fi
+
+      - name: Push changes
+        if: always()
+        run: |
+          set -euo pipefail
+
+          # Ensure git uses the workflow token for HTTPS pushes.
+          # This prevents "Password authentication is not supported" failures when the repo is public and checkout
+          # succeeded without credentials, but push requires auth.
+          TOKEN="${{ secrets.CLAUDE_WORKFLOW_TOKEN }}"
+          if [ -z "$TOKEN" ]; then
+            echo "::error::CLAUDE_WORKFLOW_TOKEN is not set (required for git push)"
+            exit 1
+          fi
+          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
+
+          MAX_RETRIES=5
+          RETRY_COUNT=0
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if git push origin "${{ inputs.work_branch }}"; then
+              echo "Push successful"
+              break
+            fi
+
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "Push failed, attempt $RETRY_COUNT of $MAX_RETRIES"
+
+            git fetch origin "${{ inputs.work_branch }}"
+            git rebase origin/"${{ inputs.work_branch }}" --strategy-option=theirs || true
+
+            sleep $((RETRY_COUNT * 2))
+          done
+
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "::warning::Push failed after $MAX_RETRIES attempts"
+          fi
+
+      - name: Parse agent output
+        id: parse-output
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          RAW_RESULT: ${{ steps.agent.outputs.result }}
+          STRUCTURED_OUTPUT: ${{ steps.agent.outputs.structured_output }}
+        with:
+          script: |
+            const raw = process.env.RAW_RESULT || '';
+            const structured = process.env.STRUCTURED_OUTPUT || '';
+
+            // Default result with all required fields
+            let result = {
+              success: false,
+              summary: 'No output parsed',
+              files_changed: [],
+              commits_made: [],
+              next_phase_ready: false,
+              blocking_issues: []
+            };
+
+            // Try structured output first
+            if (structured) {
+              try {
+                const parsed = JSON.parse(structured);
+                // Merge with defaults to ensure all fields exist
+                result = {
+                  success: parsed.success ?? false,
+                  summary: parsed.summary ?? 'No summary provided',
+                  files_changed: parsed.files_changed ?? [],
+                  commits_made: parsed.commits_made ?? [],
+                  next_phase_ready: parsed.next_phase_ready ?? false,
+                  blocking_issues: parsed.blocking_issues ?? [],
+                  next_phase_label: parsed.next_phase_label,
+                  needs_agents: parsed.needs_agents,
+                  suggestions: parsed.suggestions,
+                  assignments: parsed.assignments,
+                  review_comment: parsed.review_comment,
+                  pr_title: parsed.pr_title,
+                  pr_body: parsed.pr_body,
+                  tech_debt_items: parsed.tech_debt_items
+                };
+              } catch (e) {
+                console.log('Failed to parse structured output:', e.message);
+              }
+            }
+
+            // Fallback to raw result
+            if (!result.success && raw) {
+              try {
+                const jsonMatch = raw.match(/\{[\s\S]*\}/);
+                if (jsonMatch) {
+                  const parsed = JSON.parse(jsonMatch[0]);
+                  result = {
+                    ...result,
+                    ...parsed,
+                    success: parsed.success ?? result.success,
+                    summary: parsed.summary ?? result.summary
+                  };
+                }
+              } catch (e) {
+                console.log('Failed to parse raw output:', e.message);
+                result.summary = raw.substring(0, 500);
+              }
+            }
+
+            // Log the result for debugging
+            console.log('Agent result:', result);
+
+            // Base64 encode to avoid special character issues in workflow outputs
+            const resultJson = JSON.stringify(result);
+            const base64Result = Buffer.from(resultJson).toString('base64');
+
+            console.log('JSON length:', resultJson.length, 'Base64 length:', base64Result.length);
+
+            core.setOutput('result', base64Result);
+            core.setOutput('success', String(result.success === true));
+
+      - name: Check for clarification checkpoint
+        id: checkpoint
+        if: always()
+        run: |
+          CHECKPOINT_FILE=$(find /tmp -name "clarification-checkpoint-*.json" 2>/dev/null | head -1)
+
+          if [ -n "$CHECKPOINT_FILE" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "path=$CHECKPOINT_FILE" >> "$GITHUB_OUTPUT"
+            CHECKPOINT_ID=$(basename "$CHECKPOINT_FILE" | sed 's/clarification-checkpoint-//' | sed 's/.json//')
+            echo "id=$CHECKPOINT_ID" >> "$GITHUB_OUTPUT"
+            echo "Clarification checkpoint found: $CHECKPOINT_ID"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No clarification checkpoint"
+          fi
+
+      - name: Upload clarification checkpoint
+        if: always() && steps.checkpoint.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: clarification-checkpoint-${{ steps.checkpoint.outputs.id }}
+          path: ${{ steps.checkpoint.outputs.path }}
+          retention-days: 30

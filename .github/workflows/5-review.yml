@@ -1,0 +1,447 @@
+# V2 Review Workflow - Tech Lead code review + Product Owner acceptance
+# Triggers: v2:phase:review label added
+
+name: "V2: 5 - Review"
+
+on:
+  issues:
+    types: [labeled]
+
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number"
+        required: true
+        type: string
+
+concurrency:
+  group: v2-review-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  # Required for claude-code-action OIDC token requests
+  id-token: write
+
+jobs:
+  # ============================================================================
+  # Check if we should run
+  # ============================================================================
+  should-run:
+    name: Check Trigger
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'v2:phase:review')
+    outputs:
+      issue_number: ${{ steps.check.outputs.issue_number }}
+      work_branch: ${{ steps.check.outputs.work_branch }}
+      pr_number: ${{ steps.check.outputs.pr_number }}
+    steps:
+      - name: Get issue and PR info
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            let issueNumber;
+            if (context.eventName === 'workflow_dispatch') {
+              issueNumber = ${{ inputs.issue_number || 0 }};
+            } else {
+              issueNumber = context.payload.issue.number;
+            }
+
+            core.setOutput('issue_number', issueNumber);
+
+            // Find PR for this issue
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
+            });
+
+            const pr = prs.find(p =>
+              p.body && p.body.includes(`#${issueNumber}`)
+            );
+
+            if (pr) {
+              core.setOutput('pr_number', pr.number);
+              core.setOutput('work_branch', pr.head.ref);
+              console.log('Found PR:', pr.number, 'Branch:', pr.head.ref);
+            } else {
+              core.setOutput('pr_number', '');
+              core.setOutput('work_branch', '');
+              console.log('No PR found for issue', issueNumber);
+            }
+
+  # ============================================================================
+  # Tech Lead Code Review
+  # ============================================================================
+  tech-lead-review:
+    name: Tech Lead - Review
+    needs: should-run
+    if: needs.should-run.outputs.pr_number != ''
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: tech-lead
+      phase: review
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        Code review for PR #${{ needs.should-run.outputs.pr_number }} (Issue #${{ needs.should-run.outputs.issue_number }}).
+
+        You wrote the technical plan for this issue. Now review the implementation.
+
+        Your task:
+        1. Read the issue context file to refresh on your original plan
+        2. Review the PR diff systematically
+        3. Verify implementation matches your technical approach
+        4. Check against existing ADRs
+        5. Make a decision: APPROVED or CHANGES_REQUESTED
+        6. Update the issue context file with your review status
+
+        **CRITICAL - REQUIRED JSON OUTPUT:**
+        You MUST return a JSON object with ALL of these required fields. The pipeline WILL FAIL if any are missing:
+
+        {
+          "next_phase_ready": true,  // boolean - true if approving, false if requesting changes
+          "review_comment": "Detailed review comment...",  // string - your review feedback
+          "pr_title": "feat(scope): description",  // string - conventional commit format title
+          "pr_body": "## Summary\n\n..."  // string - markdown PR body with Summary, Changes, Testing sections
+        }
+
+        Example pr_title: "feat(auth): add OAuth2 login flow"
+        Example pr_body: "## Summary\n\nImplements OAuth2 authentication with Google and GitHub providers.\n\n## Changes\n\n- Added OAuth2 configuration\n- Implemented provider handlers\n- Added login buttons to frontend\n\n## Testing\n\n- Unit tests for OAuth handlers\n- Integration tests for login flow"
+
+        If requesting changes, set next_phase_ready to false and document blocking issues in review_comment.
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Parse Tech Lead review result
+  # ============================================================================
+  parse-tech-review:
+    name: Parse Tech Lead Review
+    needs: [should-run, tech-lead-review]
+    runs-on: ubuntu-latest
+    outputs:
+      approved: ${{ steps.parse.outputs.approved }}
+    steps:
+      - name: Parse review result and update PR
+        id: parse
+        uses: actions/github-script@v7
+        env:
+          RESULT_BASE64: ${{ needs.tech-lead-review.outputs.result }}
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            // Decode base64 result from agent-runner
+            const base64Result = process.env.RESULT_BASE64 || '';
+            let resultJson = '';
+            if (base64Result) {
+              try {
+                resultJson = Buffer.from(base64Result, 'base64').toString('utf8');
+              } catch (e) {
+                console.log('Failed to decode base64:', e.message);
+                resultJson = base64Result;
+              }
+            }
+
+            let result;
+            try {
+              result = JSON.parse(resultJson || '{}');
+              if (typeof result === 'string') {
+                result = JSON.parse(result);
+              }
+            } catch (e) {
+              core.setFailed(`Failed to parse tech lead output: ${e.message}`);
+              return;
+            }
+
+            // Validate required fields
+            const requiredFields = ['next_phase_ready', 'review_comment', 'pr_title', 'pr_body'];
+            const missingFields = requiredFields.filter(f => result[f] === undefined || result[f] === null || result[f] === '');
+            if (missingFields.length > 0) {
+              core.setFailed(`Tech lead output missing required fields: ${missingFields.join(', ')}`);
+              return;
+            }
+
+            const approved = result.next_phase_ready === true;
+            core.setOutput('approved', approved);
+            core.setOutput('review_comment', result.review_comment);
+            console.log('Tech Lead approved:', approved);
+
+            const prNumber = ${{ needs.should-run.outputs.pr_number }};
+            const issueNumber = ${{ needs.should-run.outputs.issue_number }};
+
+            // Update PR title and body
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              title: result.pr_title,
+              body: `${result.pr_body}\n\n---\n\nCloses #${issueNumber}\n\n🤖 Generated by V2 automated pipeline`
+            });
+            console.log('Updated PR title/body from tech lead output');
+
+      - name: Submit PR review
+        uses: actions/github-script@v7
+        env:
+          REVIEW_COMMENT: ${{ steps.parse.outputs.review_comment }}
+        with:
+          github-token: ${{ secrets.PR_REVIEW_PAT }}
+          script: |
+            const prNumber = ${{ needs.should-run.outputs.pr_number }};
+            const approved = '${{ steps.parse.outputs.approved }}' === 'true';
+            const reviewComment = process.env.REVIEW_COMMENT;
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              event: approved ? 'APPROVE' : 'REQUEST_CHANGES',
+              body: reviewComment
+            });
+
+  # ============================================================================
+  # Tech Lead Documentation Post-Work (after approval)
+  # ============================================================================
+  docs-post:
+    name: Tech Lead - Docs Post
+    needs: [should-run, parse-tech-review]
+    if: needs.parse-tech-review.outputs.approved == 'true'
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: tech-lead
+      phase: docs-post
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        Documentation post-work for issue #${{ needs.should-run.outputs.issue_number }}.
+
+        Your task:
+        1. Read the issue context file and your pre-work documentation notes
+        2. Review what was implemented in this PR
+        3. Update all affected documentation:
+           - README.md (if features changed)
+           - ARCHITECTURE.md (if architecture changed)
+           - API docs (if APIs changed)
+        4. Update automated/shared/RECENT-WORK.md with this issue
+        5. Add session entry to automated/shared/DEVLOG.md
+        6. Commit documentation changes
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Product Owner Acceptance
+  # ============================================================================
+  product-owner-acceptance:
+    name: Product Owner - Acceptance
+    needs: [should-run, parse-tech-review, docs-post]
+    if: always() && needs.should-run.result == 'success' && needs.parse-tech-review.outputs.approved == 'true' && needs.docs-post.result == 'success'
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: product-owner
+      phase: acceptance
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        Acceptance review for PR #${{ needs.should-run.outputs.pr_number }} (Issue #${{ needs.should-run.outputs.issue_number }}).
+
+        Tech Lead has approved the code. Now verify acceptance criteria are met.
+
+        Your task:
+        1. Read your original acceptance criteria from the issue context file
+        2. Review what was implemented
+        3. Verify each criterion is satisfied
+        4. Make a decision: ACCEPTED or REJECTED
+        5. Update the issue context file with your acceptance status
+
+        If accepting, set next_phase_ready to true for auto-merge.
+        If rejecting, document which criteria are not met.
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Parse Product Owner acceptance result
+  # ============================================================================
+  parse-acceptance:
+    name: Parse Acceptance Result
+    needs: [should-run, product-owner-acceptance]
+    runs-on: ubuntu-latest
+    outputs:
+      accepted: ${{ steps.parse.outputs.accepted }}
+    steps:
+      - name: Parse acceptance result
+        id: parse
+        uses: actions/github-script@v7
+        env:
+          RESULT_BASE64: ${{ needs.product-owner-acceptance.outputs.result }}
+        with:
+          script: |
+            // Decode base64 result from agent-runner
+            const base64Result = process.env.RESULT_BASE64 || '';
+            let resultJson = '';
+            if (base64Result) {
+              try {
+                resultJson = Buffer.from(base64Result, 'base64').toString('utf8');
+              } catch (e) {
+                console.log('Failed to decode base64:', e.message);
+                resultJson = base64Result;
+              }
+            }
+
+            let result;
+            try {
+              result = JSON.parse(resultJson || '{}');
+            } catch (e) {
+              result = { next_phase_ready: false };
+            }
+
+            const accepted = result.next_phase_ready === true;
+            core.setOutput('accepted', accepted);
+            console.log('Product Owner accepted:', accepted);
+
+  # ============================================================================
+  # Auto-Merge
+  # ============================================================================
+  auto-merge:
+    name: Auto-Merge
+    needs: [should-run, parse-acceptance]
+    if: needs.parse-acceptance.outputs.accepted == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const prNumber = ${{ needs.should-run.outputs.pr_number }};
+            const issueNumber = ${{ needs.should-run.outputs.issue_number }};
+
+            // Get PR for commit message
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            // Squash and merge
+            await github.rest.pulls.merge({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              merge_method: 'squash',
+              commit_title: `${pr.title} (#${prNumber})`,
+              commit_message: `Closes #${issueNumber}\n\n🤖 Generated by V2 automated pipeline`
+            });
+
+            console.log('PR merged successfully');
+
+            // Clean up labels
+            const labelsToRemove = ['v2:phase:review', 'v2:phase:planning', 'v2:phase:development', 'v2:phase:validation'];
+            for (const label of labelsToRemove) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  name: label
+                });
+              } catch (e) {}
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: ['v2:completed']
+            });
+
+      - name: Delete branch
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            try {
+              await github.rest.git.deleteRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `heads/${{ needs.should-run.outputs.work_branch }}`
+              });
+              console.log('Branch deleted');
+            } catch (e) {
+              console.log('Could not delete branch:', e.message);
+            }
+
+  # ============================================================================
+  # Handle Review Rejection (Tech Lead)
+  # ============================================================================
+  handle-tech-rejection:
+    name: Handle Tech Lead Rejection
+    needs: [should-run, parse-tech-review]
+    if: needs.parse-tech-review.outputs.approved != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Route to feedback loop
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const issueNumber = ${{ needs.should-run.outputs.issue_number }};
+
+            // Add fix iteration label
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: ['v2:fix-iteration-1']
+            });
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: '⚠️ **Tech Lead Review: Changes Requested**\n\nRouting to feedback loop for fixes. See issue context file for details.'
+            });
+
+  # ============================================================================
+  # Handle Acceptance Rejection (Product Owner)
+  # ============================================================================
+  handle-acceptance-rejection:
+    name: Handle Acceptance Rejection
+    needs: [should-run, parse-acceptance]
+    if: needs.parse-acceptance.outputs.accepted != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Route back for fixes
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const issueNumber = ${{ needs.should-run.outputs.issue_number }};
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: ['v2:acceptance-failed']
+            });
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: '❌ **Product Owner Acceptance: Rejected**\n\nAcceptance criteria not fully met. See issue context file for which criteria failed.'
+            });
+

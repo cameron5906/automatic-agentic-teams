@@ -1,0 +1,423 @@
+# V2 Validation Workflow - QA and Security review
+# Triggers: v2:phase:validation label added
+
+name: "V2: 4 - Validation"
+
+on:
+  issues:
+    types: [labeled]
+
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number"
+        required: true
+        type: string
+
+concurrency:
+  group: v2-validation-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  # Required for claude-code-action OIDC token requests
+  id-token: write
+
+jobs:
+  # ============================================================================
+  # Check if we should run
+  # ============================================================================
+  should-run:
+    name: Check Trigger
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'v2:phase:validation')
+    outputs:
+      issue_number: ${{ steps.check.outputs.issue_number }}
+      work_branch: ${{ steps.check.outputs.work_branch }}
+      needs_security_review: ${{ steps.check.outputs.needs_security_review }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          fetch-depth: 0
+
+      - name: Get issue info
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ISSUE_NUMBER="${{ inputs.issue_number }}"
+          else
+            ISSUE_NUMBER="${{ github.event.issue.number }}"
+          fi
+
+          echo "issue_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+
+          # Find work branch
+          BRANCH=$(git branch -r | grep "issue-${ISSUE_NUMBER}-" | head -1 | sed 's/.*origin\///')
+
+          if [ -z "$BRANCH" ]; then
+            echo "::error::No work branch found for issue #${ISSUE_NUMBER}. Expected branch matching 'issue-${ISSUE_NUMBER}-*'"
+            exit 1
+          fi
+
+          echo "work_branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+          # Check if security review is needed (was in planning)
+          git checkout "$BRANCH"
+          CONTEXT_FILE=$(find automated/shared/issues -name "${ISSUE_NUMBER}-*.md" 2>/dev/null | head -1)
+
+          if [ -n "$CONTEXT_FILE" ] && grep -q "Security Requirements" "$CONTEXT_FILE"; then
+            echo "needs_security_review=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_security_review=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ============================================================================
+  # QA Engineer Validation
+  # ============================================================================
+  qa-validation:
+    name: QA Engineer - Validation
+    needs: should-run
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: qa-engineer
+      phase: validation
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        QA validation for issue #${{ needs.should-run.outputs.issue_number }}.
+
+        Your task:
+        1. Run all tests and verify they pass
+        2. Analyze test coverage:
+           - Are acceptance criteria covered?
+           - Are edge cases covered?
+           - Are error paths covered?
+        3. Add missing tests for gaps you identify
+        4. Clean up code if you find issues
+        5. Update the issue context file with validation results
+        6. Do NOT create the PR yet - that happens after security review
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Parse QA result
+  # ============================================================================
+  parse-qa:
+    name: Parse QA Result
+    needs: [should-run, qa-validation]
+    runs-on: ubuntu-latest
+    outputs:
+      success: ${{ steps.parse.outputs.success }}
+    steps:
+      - name: Parse QA result
+        id: parse
+        uses: actions/github-script@v7
+        env:
+          RESULT_BASE64: ${{ needs.qa-validation.outputs.result }}
+        with:
+          script: |
+            // Decode base64 result from agent-runner
+            const base64Result = process.env.RESULT_BASE64 || '';
+            let resultJson = '';
+            if (base64Result) {
+              try {
+                resultJson = Buffer.from(base64Result, 'base64').toString('utf8');
+              } catch (e) {
+                console.log('Failed to decode base64:', e.message);
+                resultJson = base64Result;
+              }
+            }
+
+            let result;
+            try {
+              result = JSON.parse(resultJson || '{}');
+            } catch (e) {
+              result = { next_phase_ready: false };
+            }
+            // Output as string 'true' or 'false' for proper conditional comparison
+            core.setOutput('success', String(result.next_phase_ready === true || result.success === true));
+
+  # ============================================================================
+  # Security Engineer Review (if was in planning)
+  # ============================================================================
+  security-review:
+    name: Security Engineer - Review
+    needs: [should-run, parse-qa]
+    if: needs.should-run.outputs.needs_security_review == 'true' && needs.parse-qa.outputs.success == 'true'
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: security-engineer
+      phase: review
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        Security review for issue #${{ needs.should-run.outputs.issue_number }}.
+
+        You defined security requirements during planning. Now verify they were implemented.
+
+        Your task:
+        1. Read your original security requirements from the issue context file
+        2. Review the implementation for security issues
+        3. Verify your requirements were properly implemented
+        4. Check for common vulnerabilities (OWASP Top 10)
+        5. Make a decision: PASS or FAIL
+        6. Update the issue context file with your review results
+
+        If FAIL, document specific issues that must be fixed.
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Parse Security result
+  # ============================================================================
+  parse-security:
+    name: Parse Security Result
+    needs: [should-run, security-review]
+    if: always() && needs.should-run.result == 'success' && (needs.security-review.result == 'success' || needs.security-review.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      success: ${{ steps.parse.outputs.success }}
+    steps:
+      - name: Parse security result
+        id: parse
+        uses: actions/github-script@v7
+        env:
+          RESULT_BASE64: ${{ needs.security-review.outputs.result }}
+          SKIPPED: ${{ needs.security-review.result == 'skipped' }}
+        with:
+          script: |
+            if (process.env.SKIPPED === 'true') {
+              core.setOutput('success', 'true');
+              return;
+            }
+
+            // Decode base64 result from agent-runner
+            const base64Result = process.env.RESULT_BASE64 || '';
+            let resultJson = '';
+            if (base64Result) {
+              try {
+                resultJson = Buffer.from(base64Result, 'base64').toString('utf8');
+              } catch (e) {
+                console.log('Failed to decode base64:', e.message);
+                resultJson = base64Result;
+              }
+            }
+
+            let result;
+            try {
+              result = JSON.parse(resultJson || '{}');
+            } catch (e) {
+              result = { next_phase_ready: false };
+            }
+            // Output as string 'true' or 'false' for proper conditional comparison
+            core.setOutput('success', String(result.next_phase_ready === true || result.success === true));
+
+  # ============================================================================
+  # Create Pull Request
+  # ============================================================================
+  create-pr:
+    name: Create Pull Request
+    needs: [should-run, parse-qa, parse-security]
+    if: |
+      always() &&
+      needs.should-run.result == 'success' &&
+      needs.parse-qa.outputs.success == 'true' &&
+      (needs.parse-security.result == 'skipped' || needs.parse-security.outputs.success == 'true')
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.create.outputs.pr_number }}
+    steps:
+      - name: Checkout work branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.should-run.outputs.work_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+
+      - name: Get issue details
+        id: issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.should-run.outputs.issue_number }}
+            });
+
+            core.setOutput('title', issue.title);
+            core.setOutput('body', issue.body || '');
+
+      - name: Create PR
+        id: create
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const issueNumber = ${{ needs.should-run.outputs.issue_number }};
+            const branch = '${{ needs.should-run.outputs.work_branch }}';
+            const issueTitle = `${{ steps.issue.outputs.title }}`;
+
+            // Check if PR already exists
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${branch}`,
+              state: 'open'
+            });
+
+            if (prs.length > 0) {
+              console.log('PR already exists:', prs[0].number);
+              core.setOutput('pr_number', prs[0].number);
+              return;
+            }
+
+            // Create PR with placeholder content (Tech Lead will update during review)
+            const { data: pr } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Pending Review] ${issueTitle}`,
+              head: branch,
+              base: 'main',
+              body: `## ⏳ Pending Tech Lead Review
+
+            This PR was auto-generated for issue #${issueNumber}.
+
+            **The Tech Lead will update this PR with:**
+            - Proper conventional commit title
+            - Detailed summary of changes
+            - Testing information
+
+            ---
+
+            ### Pipeline Status
+
+            - [x] QA validation passed
+            - [x] Security review passed (if applicable)
+            - [ ] Tech Lead review (will update PR title & body)
+            - [ ] Product Owner acceptance
+
+            ---
+
+            Refs #${issueNumber}`
+            });
+
+            console.log('Created PR:', pr.number);
+            core.setOutput('pr_number', pr.number);
+
+  # ============================================================================
+  # Transition to Review
+  # ============================================================================
+  transition:
+    name: Transition to Review
+    needs: [should-run, create-pr]
+    if: always() && needs.should-run.result == 'success' && needs.create-pr.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update labels for next phase
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const issueNumber = ${{ needs.should-run.outputs.issue_number }};
+            const prNumber = ${{ needs.create-pr.outputs.pr_number }};
+
+            // Remove validation label, add review label
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                name: 'v2:phase:validation'
+              });
+            } catch (e) {
+              console.log('Validation label not found, continuing');
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: ['v2:phase:review']
+            });
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: `✅ **Validation Complete** - Moving to review phase.\n\nPR #${prNumber} created and ready for Tech Lead review.`
+            });
+
+  # ============================================================================
+  # Handle validation failure
+  # ============================================================================
+  handle-failure:
+    name: Handle Failure
+    needs: [should-run, parse-qa, parse-security]
+    if: |
+      needs.should-run.result == 'success' && (
+        failure() ||
+        needs.parse-qa.outputs.success != 'true' ||
+        (needs.parse-security.result != 'skipped' && needs.parse-security.outputs.success != 'true')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add needs-dev-fix label
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ needs.should-run.outputs.issue_number }}
+          QA_SUCCESS: ${{ needs.parse-qa.outputs.success }}
+          SECURITY_SUCCESS: ${{ needs.parse-security.outputs.success }}
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const issueNumber = parseInt(process.env.ISSUE_NUMBER, 10);
+            if (!issueNumber) {
+              console.log('No issue number available, cannot update labels');
+              return;
+            }
+
+            // Determine failure reason
+            let reason = 'Validation failed';
+            if (process.env.QA_SUCCESS !== 'true') {
+              reason = 'QA validation found issues';
+            } else if (process.env.SECURITY_SUCCESS !== 'true') {
+              reason = 'Security review found issues';
+            }
+
+            // Remove validation label, add needs-dev-fix
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                name: 'v2:phase:validation'
+              });
+            } catch (e) {}
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: ['v2:needs-dev-fix', 'v2:phase:development']
+            });
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: `⚠️ **Validation Failed** - ${reason}\n\nReturning to development phase. See issue context file for details on what needs fixing.`
+            });
+

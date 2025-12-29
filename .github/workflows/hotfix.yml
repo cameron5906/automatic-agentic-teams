@@ -1,0 +1,557 @@
+# V2 Hotfix Workflow - Expedited path for critical issues
+# Triggers: hotfix OR priority:critical label
+
+name: "V2: Hotfix"
+
+on:
+  issues:
+    types: [labeled]
+
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number"
+        required: true
+        type: string
+
+concurrency:
+  group: v2-hotfix-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  # Required for claude-code-action OIDC token requests
+  id-token: write
+
+jobs:
+  # ============================================================================
+  # Check if we should run
+  # ============================================================================
+  should-run:
+    name: Check Trigger
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'labeled' && (github.event.label.name == 'hotfix' || github.event.label.name == 'priority:critical'))
+    outputs:
+      issue_number: ${{ steps.check.outputs.issue_number }}
+      work_branch: ${{ steps.check.outputs.work_branch }}
+      issue_title: ${{ steps.check.outputs.issue_title }}
+      issue_body: ${{ steps.check.outputs.issue_body }}
+    steps:
+      - name: Get issue info
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            let issueNumber;
+            if (context.eventName === 'workflow_dispatch') {
+              issueNumber = ${{ inputs.issue_number || 0 }};
+            } else {
+              issueNumber = context.payload.issue.number;
+            }
+
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber
+            });
+
+            // Create slug
+            const slug = issue.title
+              .toLowerCase()
+              .replace(/[^a-z0-9]/g, '-')
+              .replace(/-+/g, '-')
+              .replace(/^-|-$/g, '')
+              .substring(0, 40);
+
+            const branch = `hotfix/issue-${issueNumber}-${slug}`;
+
+            core.setOutput('issue_number', issueNumber);
+            core.setOutput('work_branch', branch);
+            core.setOutput('issue_title', issue.title);
+            core.setOutput('issue_body', issue.body || '');
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          fetch-depth: 0
+
+      - name: Setup hotfix branch
+        run: |
+          BRANCH="${{ steps.check.outputs.work_branch }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Fetch all remote branches
+          git fetch origin
+
+          # Check if branch already exists on remote
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+            echo "Branch $BRANCH already exists, checking it out"
+            git checkout "$BRANCH"
+            git pull origin "$BRANCH"
+          else
+            echo "Creating new branch $BRANCH from latest main"
+            git checkout main
+            git pull origin main
+            git checkout -b "$BRANCH"
+            git push -u origin "$BRANCH"
+          fi
+
+      - name: Create minimal issue context
+        run: |
+          CONTEXT_FILE="automated/shared/issues/${{ steps.check.outputs.issue_number }}-hotfix.md"
+
+          # Only create if it doesn't exist
+          if [ ! -f "$CONTEXT_FILE" ]; then
+            mkdir -p automated/shared/issues
+
+            cat > "$CONTEXT_FILE" << 'CONTEXT_EOF'
+          # Issue #${{ steps.check.outputs.issue_number }}: ${{ steps.check.outputs.issue_title }}
+
+          **Status:** hotfix
+          **Mode:** HOTFIX - EXPEDITED
+          **Branch:** ${{ steps.check.outputs.work_branch }}
+          **Created:** $(date -Iseconds)
+
+          ---
+
+          ## Issue Description
+
+          ${{ steps.check.outputs.issue_body }}
+
+          ---
+
+          ## Tech Lead Planning (HOTFIX)
+
+          _Pending_
+
+          ---
+
+          ## Development Notes
+
+          _Pending_
+
+          ---
+
+          ## Validation
+
+          _Pending_
+          CONTEXT_EOF
+
+            git add -A
+            git commit -m "chore: create hotfix context for #${{ steps.check.outputs.issue_number }}"
+            git push
+          else
+            echo "Context file already exists, skipping creation"
+          fi
+
+  # ============================================================================
+  # Tech Lead Hotfix Planning
+  # ============================================================================
+  hotfix-planning:
+    name: Tech Lead - Hotfix Planning
+    needs: should-run
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: tech-lead
+      phase: planning-hotfix
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        HOTFIX planning for issue #${{ needs.should-run.outputs.issue_number }}: "${{ needs.should-run.outputs.issue_title }}"
+
+        This is a HOTFIX - production may be affected. Speed is critical.
+
+        Issue description:
+        ${{ needs.should-run.outputs.issue_body }}
+
+        Your task:
+        1. Quickly analyze the issue - what's broken, what's the root cause?
+        2. Create a minimal fix assignment for the Full-Stack Engineer
+        3. Update the issue context file with your hotfix plan
+        4. No ADR needed unless critical architecture flaw discovered
+        5. Skip UX Designer involvement
+        6. Security check only if auth/data related
+
+        Target: Planning complete in < 5 minutes.
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Full-Stack Engineer Hotfix Development
+  # ============================================================================
+  hotfix-dev:
+    name: Full-Stack Engineer - Hotfix Dev
+    needs: [should-run, hotfix-planning]
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: full-stack-engineer
+      phase: dev-hotfix
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        HOTFIX development for issue #${{ needs.should-run.outputs.issue_number }}.
+
+        This is a HOTFIX - speed is critical.
+
+        Your task:
+        1. Read your assignment from the issue context file
+        2. Write a test that reproduces the bug
+        3. Fix the bug with minimal code changes
+        4. Verify the test passes
+        5. Commit and update issue context
+
+        Target: Fix complete in < 20 minutes.
+        No refactoring, no feature additions - just fix the bug.
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # QA Engineer Quick Validation
+  # ============================================================================
+  hotfix-validation:
+    name: QA Engineer - Quick Validation
+    needs: [should-run, hotfix-dev]
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: qa-engineer
+      phase: validation
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        HOTFIX validation for issue #${{ needs.should-run.outputs.issue_number }}.
+
+        Quick validation - verify the fix works.
+
+        Your task:
+        1. Run all tests - verify they pass
+        2. Verify the bug reproduction test passes
+        3. Quick regression check
+        4. Update issue context with validation result
+
+        Target: Validation complete in < 10 minutes.
+
+        If validation passes, set next_phase_ready to true.
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Parse validation result
+  # ============================================================================
+  parse-validation:
+    name: Parse Validation Result
+    needs: [should-run, hotfix-validation]
+    runs-on: ubuntu-latest
+    outputs:
+      success: ${{ steps.parse.outputs.success }}
+    steps:
+      - name: Parse validation result
+        id: parse
+        uses: actions/github-script@v7
+        env:
+          RESULT_BASE64: ${{ needs.hotfix-validation.outputs.result }}
+          SUCCESS: ${{ needs.hotfix-validation.outputs.success }}
+        with:
+          script: |
+            const directSuccess = process.env.SUCCESS || '';
+
+            console.log('=== Validation Output Debug ===');
+            console.log('Direct success output:', directSuccess);
+
+            // First check: use the direct success output from agent-runner
+            if (directSuccess === 'true') {
+              console.log('Using direct success output from agent-runner');
+              core.setOutput('success', 'true');
+              return;
+            }
+
+            // Decode base64 result from agent-runner
+            const base64Result = process.env.RESULT_BASE64 || '';
+            let resultJson = '';
+            console.log('Base64 RESULT length:', base64Result.length);
+
+            if (base64Result) {
+              try {
+                resultJson = Buffer.from(base64Result, 'base64').toString('utf8');
+                console.log('Decoded JSON length:', resultJson.length);
+              } catch (e) {
+                console.log('Failed to decode base64:', e.message);
+                resultJson = base64Result;
+              }
+            }
+
+            // Parse the result JSON
+            let result;
+            try {
+              result = JSON.parse(resultJson || '{}');
+              // Handle double-stringified JSON
+              if (typeof result === 'string') {
+                console.log('Result was double-stringified, parsing again');
+                result = JSON.parse(result);
+              }
+              console.log('Parsed successfully');
+            } catch (e) {
+              console.log('Parse error:', e.message);
+              result = { next_phase_ready: false, success: false };
+            }
+
+            // Check both next_phase_ready and success fields
+            const isReady = result.next_phase_ready === true || result.success === true;
+            const successOutput = String(isReady);
+            core.setOutput('success', successOutput);
+
+            console.log('Validation result object:', JSON.stringify(result, null, 2));
+            console.log('next_phase_ready:', result.next_phase_ready);
+            console.log('success field:', result.success);
+            console.log('Final success output:', successOutput);
+
+  # ============================================================================
+  # Create PR and Tech Lead Review
+  # ============================================================================
+  create-pr-and-review:
+    name: Create PR & Tech Lead Review
+    needs: [should-run, parse-validation]
+    if: needs.parse-validation.outputs.success == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.create.outputs.pr_number }}
+      approved: ${{ steps.review.outputs.approved }}
+    steps:
+      - name: Checkout work branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.should-run.outputs.work_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+
+      - name: Create PR
+        id: create
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const issueNumber = ${{ needs.should-run.outputs.issue_number }};
+            const branch = '${{ needs.should-run.outputs.work_branch }}';
+            const title = 'HOTFIX: ${{ needs.should-run.outputs.issue_title }}';
+
+            // Create PR with placeholder content (Tech Lead will update during review)
+            const { data: pr } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Pending Review] ${title}`,
+              head: branch,
+              base: 'main',
+              body: `## 🚨 HOTFIX - Pending Tech Lead Review
+
+            This hotfix PR was auto-generated for issue #${issueNumber}.
+
+            **The Tech Lead will update this PR with:**
+            - Proper conventional commit title (fix scope)
+            - Root cause analysis
+            - Fix details and testing
+
+            ---
+
+            ### Pipeline Status
+
+            - [x] QA validation passed
+            - [ ] Tech Lead review (will update PR title & body)
+
+            ---
+
+            Refs #${issueNumber}`
+            });
+
+            core.setOutput('pr_number', pr.number);
+
+  # ============================================================================
+  # Tech Lead Review
+  # ============================================================================
+  tech-lead-review:
+    name: Tech Lead - Review
+    needs: [should-run, create-pr-and-review]
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: tech-lead
+      phase: review
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        HOTFIX review for PR #${{ needs.create-pr-and-review.outputs.pr_number }}.
+
+        Expedited review - verify the fix is safe.
+
+        Your task:
+        1. Verify the fix addresses the root cause
+        2. Check for any obvious issues
+        3. Approve if fix is safe and correct
+
+        Target: Review complete in < 5 minutes.
+        Skip Product Owner acceptance for hotfixes.
+
+        **CRITICAL - REQUIRED JSON OUTPUT:**
+        You MUST return a JSON object with ALL of these required fields. The pipeline WILL FAIL if any are missing:
+
+        {
+          "next_phase_ready": true,  // boolean - true if approving, false if requesting changes
+          "review_comment": "Detailed review comment...",  // string - your review feedback
+          "pr_title": "fix(scope): description",  // string - conventional commit format title
+          "pr_body": "## Summary\n\n..."  // string - markdown PR body with Summary, Changes, Testing sections
+        }
+
+        Example pr_title: "fix(auth): resolve null pointer in login handler"
+        Example pr_body: "## Summary\n\nFixes critical null pointer exception in login flow.\n\n## Changes\n\n- Added null check before accessing user profile\n- Added unit test for edge case\n\n## Testing\n\n- Unit tests pass\n- Manual verification of login flow"
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Parse review result and submit approval
+  # ============================================================================
+  parse-review:
+    name: Parse Review Result
+    needs: [should-run, create-pr-and-review, tech-lead-review]
+    runs-on: ubuntu-latest
+    outputs:
+      approved: ${{ steps.parse.outputs.approved }}
+    steps:
+      - name: Parse review result and update PR
+        id: parse
+        uses: actions/github-script@v7
+        env:
+          RESULT_BASE64: ${{ needs.tech-lead-review.outputs.result }}
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            // Decode base64 result from agent-runner
+            const base64Result = process.env.RESULT_BASE64 || '';
+            let resultJson = '';
+            if (base64Result) {
+              try {
+                resultJson = Buffer.from(base64Result, 'base64').toString('utf8');
+              } catch (e) {
+                console.log('Failed to decode base64:', e.message);
+                resultJson = base64Result;
+              }
+            }
+
+            let result;
+            try {
+              result = JSON.parse(resultJson || '{}');
+              if (typeof result === 'string') {
+                result = JSON.parse(result);
+              }
+            } catch (e) {
+              core.setFailed(`Failed to parse tech lead output: ${e.message}`);
+              return;
+            }
+
+            // Validate required fields
+            const requiredFields = ['next_phase_ready', 'review_comment', 'pr_title', 'pr_body'];
+            const missingFields = requiredFields.filter(f => result[f] === undefined || result[f] === null || result[f] === '');
+            if (missingFields.length > 0) {
+              core.setFailed(`Tech lead output missing required fields: ${missingFields.join(', ')}`);
+              return;
+            }
+
+            const approved = result.next_phase_ready === true;
+            core.setOutput('approved', String(approved));
+            core.setOutput('review_comment', result.review_comment);
+            console.log('Tech Lead approved:', approved);
+
+            const prNumber = ${{ needs.create-pr-and-review.outputs.pr_number }};
+            const issueNumber = ${{ needs.should-run.outputs.issue_number }};
+
+            // Update PR title and body
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              title: result.pr_title,
+              body: `${result.pr_body}\n\n---\n\nCloses #${issueNumber}\n\n🤖 Generated by V2 Hotfix Pipeline`
+            });
+            console.log('Updated PR title/body from tech lead output');
+
+      - name: Submit PR review
+        uses: actions/github-script@v7
+        env:
+          REVIEW_COMMENT: ${{ steps.parse.outputs.review_comment }}
+        with:
+          github-token: ${{ secrets.PR_REVIEW_PAT }}
+          script: |
+            const prNumber = ${{ needs.create-pr-and-review.outputs.pr_number }};
+            const approved = '${{ steps.parse.outputs.approved }}' === 'true';
+            const reviewComment = process.env.REVIEW_COMMENT;
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              event: approved ? 'APPROVE' : 'REQUEST_CHANGES',
+              body: reviewComment
+            });
+
+  # ============================================================================
+  # Auto-Merge Hotfix
+  # ============================================================================
+  auto-merge:
+    name: Auto-Merge Hotfix
+    needs: [should-run, create-pr-and-review, parse-review]
+    if: needs.parse-review.outputs.approved == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const prNumber = ${{ needs.create-pr-and-review.outputs.pr_number }};
+            const issueNumber = ${{ needs.should-run.outputs.issue_number }};
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            await github.rest.pulls.merge({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              merge_method: 'squash',
+              commit_title: `${pr.title} (#${prNumber})`,
+              commit_message: `Hotfix for #${issueNumber}\n\nGenerated by V2 Hotfix Pipeline`
+            });
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: ['v2:completed', 'v2:hotfix-merged']
+            });
+
+            // Delete branch
+            try {
+              await github.rest.git.deleteRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `heads/${{ needs.should-run.outputs.work_branch }}`
+              });
+            } catch (e) {}

@@ -1,0 +1,330 @@
+# V2 Planning Workflow - Tech Lead orchestrates planning phase
+# Triggers: v2:phase:planning label added
+
+name: "V2: 2 - Planning"
+
+on:
+  issues:
+    types: [labeled]
+
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to plan"
+        required: true
+        type: string
+
+concurrency:
+  group: v2-planning-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  # Required for claude-code-action OIDC token requests
+  id-token: write
+
+jobs:
+  # ============================================================================
+  # Check if we should run
+  # ============================================================================
+  should-run:
+    name: Check Trigger
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'v2:phase:planning')
+    outputs:
+      issue_number: ${{ steps.check.outputs.issue_number }}
+      work_branch: ${{ steps.check.outputs.work_branch }}
+      issue_context_file: ${{ steps.check.outputs.issue_context_file }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+
+      - name: Get issue info and find context
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ISSUE_NUMBER="${{ inputs.issue_number }}"
+          else
+            ISSUE_NUMBER="${{ github.event.issue.number }}"
+          fi
+
+          echo "issue_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+
+          # Find work branch
+          BRANCH=$(git branch -r | grep "issue-${ISSUE_NUMBER}-" | head -1 | sed 's/.*origin\///')
+          if [ -z "$BRANCH" ]; then
+            BRANCH="main"
+          fi
+          echo "work_branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+          # Find issue context file
+          CONTEXT_FILE=$(find automated/shared/issues -name "${ISSUE_NUMBER}-*.md" 2>/dev/null | head -1)
+          echo "issue_context_file=$CONTEXT_FILE" >> "$GITHUB_OUTPUT"
+
+          echo "Issue: $ISSUE_NUMBER, Branch: $BRANCH, Context: $CONTEXT_FILE"
+
+  # ============================================================================
+  # Tech Lead Documentation Pre-Work
+  # ============================================================================
+  docs-pre:
+    name: Tech Lead - Docs Pre
+    needs: should-run
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: tech-lead
+      phase: docs-pre
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        Documentation pre-work for issue #${{ needs.should-run.outputs.issue_number }}.
+
+        Your task:
+        1. Review the issue context file to understand what's being built
+        2. Search for relevant existing documentation (README, ARCHITECTURE, docs/)
+        3. Check existing ADRs that may govern this work
+        4. Document current state for comparison in post-work
+        5. Note what documentation may need updating after implementation
+
+        Update the issue context file with your documentation pre-work assessment.
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Tech Lead Planning (main)
+  # ============================================================================
+  tech-lead-planning:
+    name: Tech Lead - Planning
+    needs: [should-run, docs-pre]
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: tech-lead
+      phase: planning
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        Technical planning for issue #${{ needs.should-run.outputs.issue_number }}.
+
+        Your task:
+        1. Read the issue context file with Product Owner's acceptance criteria
+        2. Analyze the codebase to understand current architecture
+        3. Check existing ADRs in automated/shared/adrs/
+        4. Determine which agents are needed:
+           - UI work? → Flag needs_ux: true
+           - Security sensitive? → Flag needs_security: true
+           - Infrastructure changes? → Flag needs_infrastructure: true
+        5. Design the technical approach
+        6. Create specific work assignments for engineers
+        7. Create ADR if significant architectural decision
+        8. Update the issue context file with your complete plan
+
+        Your output must include needs_agents array with agents needed.
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Parse Tech Lead Output
+  # ============================================================================
+  parse-planning:
+    name: Parse Planning Result
+    needs: [should-run, tech-lead-planning]
+    runs-on: ubuntu-latest
+    outputs:
+      needs_ux: ${{ steps.parse.outputs.needs_ux }}
+      needs_security: ${{ steps.parse.outputs.needs_security }}
+      needs_infrastructure: ${{ steps.parse.outputs.needs_infrastructure }}
+      assignments: ${{ steps.parse.outputs.assignments }}
+    steps:
+      - name: Parse planning result
+        id: parse
+        uses: actions/github-script@v7
+        env:
+          RESULT_BASE64: ${{ needs.tech-lead-planning.outputs.result }}
+        with:
+          script: |
+            // Decode base64 result from agent-runner
+            const base64Result = process.env.RESULT_BASE64 || '';
+            let resultJson = '';
+
+            if (base64Result) {
+              try {
+                resultJson = Buffer.from(base64Result, 'base64').toString('utf8');
+              } catch (e) {
+                console.log('Failed to decode base64:', e.message);
+                resultJson = base64Result;
+              }
+            }
+
+            let result;
+            try {
+              result = JSON.parse(resultJson || '{}');
+            } catch (e) {
+              result = { needs_agents: [] };
+            }
+
+            const needsAgents = result.needs_agents || [];
+
+            core.setOutput('needs_ux', needsAgents.includes('ux-designer'));
+            core.setOutput('needs_security', needsAgents.includes('security-engineer'));
+            core.setOutput('needs_infrastructure', needsAgents.includes('infrastructure-engineer'));
+            core.setOutput('assignments', JSON.stringify(result.assignments || {}));
+
+            console.log('Needs UX:', needsAgents.includes('ux-designer'));
+            console.log('Needs Security:', needsAgents.includes('security-engineer'));
+            console.log('Needs Infrastructure:', needsAgents.includes('infrastructure-engineer'));
+
+  # ============================================================================
+  # UX Designer (conditional)
+  # ============================================================================
+  ux-designer:
+    name: UX Designer - Planning
+    needs: [should-run, parse-planning]
+    if: needs.parse-planning.outputs.needs_ux == 'true'
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: ux-designer
+      phase: planning
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        UX design specifications for issue #${{ needs.should-run.outputs.issue_number }}.
+
+        Tech Lead has flagged this issue as needing UX work.
+
+        Your task:
+        1. Read the issue context file for acceptance criteria and technical approach
+        2. Review existing design patterns in the codebase
+        3. Create design specifications:
+           - User flows
+           - Component specifications
+           - Layout and spacing
+           - Responsive behavior
+           - Accessibility requirements
+        4. Update the issue context file with your UX specifications
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Security Engineer (conditional)
+  # ============================================================================
+  security-planning:
+    name: Security Engineer - Planning
+    needs: [should-run, parse-planning]
+    if: needs.parse-planning.outputs.needs_security == 'true'
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: security-engineer
+      phase: planning
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        Security requirements for issue #${{ needs.should-run.outputs.issue_number }}.
+
+        Tech Lead has flagged this issue as security-sensitive.
+
+        Your task:
+        1. Analyze the issue for security implications
+        2. Review the technical approach from Tech Lead
+        3. Define security requirements that must be met
+        4. Identify potential vulnerabilities to watch for
+        5. Specify security tests that should be written
+        6. Update the issue context file with your requirements
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Infrastructure Engineer Context (conditional)
+  # ============================================================================
+  infrastructure-planning:
+    name: Infrastructure Engineer - Planning
+    needs: [should-run, parse-planning]
+    if: needs.parse-planning.outputs.needs_infrastructure == 'true'
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: infrastructure-engineer
+      phase: planning
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.should-run.outputs.work_branch }}
+      task_prompt: |
+        Infrastructure context for issue #${{ needs.should-run.outputs.issue_number }}.
+
+        Tech Lead has flagged this issue as needing infrastructure work.
+
+        Your task:
+        1. Analyze the issue for infrastructure implications
+        2. Review current CDK stacks and AWS resources
+        3. Identify infrastructure needs (new resources, config changes, env vars)
+        4. Provide context for Tech Lead's planning
+        5. Flag potential issues or constraints
+        6. Update the issue context file with your analysis
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Transition to Development
+  # ============================================================================
+  transition:
+    name: Transition to Development
+    needs:
+      [
+        should-run,
+        parse-planning,
+        ux-designer,
+        security-planning,
+        infrastructure-planning,
+      ]
+    if: always() && needs.should-run.result == 'success' && needs.parse-planning.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update labels for next phase
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const issueNumber = ${{ needs.should-run.outputs.issue_number }};
+
+            // Remove planning label, add development label
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                name: 'v2:phase:planning'
+              });
+            } catch (e) {
+              console.log('Planning label not found, continuing');
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: ['v2:phase:development']
+            });
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: '📋 **Planning Complete** - Moving to development phase.\n\nTechnical approach and work assignments are documented in the issue context file.'
+            });
+

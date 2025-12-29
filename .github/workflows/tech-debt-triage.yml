@@ -1,0 +1,265 @@
+# Tech Debt Triage Workflow - Tech Lead reviews and prioritizes tech debt
+# Runs daily at 7 PM UTC
+
+name: "Ancillary: Tech Debt Triage"
+
+on:
+  schedule:
+    - cron: '0 19 * * *'  # Daily 7 PM UTC
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  # Required for claude-code-action OIDC token requests
+  id-token: write
+
+jobs:
+  # ============================================================================
+  # Check if there's debt to triage
+  # ============================================================================
+  check-debt:
+    name: Check Tech Debt
+    runs-on: ubuntu-latest
+    outputs:
+      has_debt: ${{ steps.check.outputs.has_debt }}
+      debt_count: ${{ steps.check.outputs.debt_count }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check TECH-DEBT.md
+        id: check
+        run: |
+          debtFile="automated/shared/TECH-DEBT.md"
+
+          if [ ! -f "$debtFile" ]; then
+            echo "has_debt=false" >> $GITHUB_OUTPUT
+            echo "debt_count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Count unchecked items
+          debtCount=$(grep -c "^\s*- \[ \]" "$debtFile" 2>/dev/null || echo "0")
+
+          echo "debt_count=$debtCount" >> $GITHUB_OUTPUT
+
+          if [ "$debtCount" -gt "0" ]; then
+            echo "has_debt=true" >> $GITHUB_OUTPUT
+            echo "Found $debtCount tech debt items to triage"
+          else
+            echo "has_debt=false" >> $GITHUB_OUTPUT
+            echo "No tech debt items to triage"
+          fi
+
+  # ============================================================================
+  # Tech Lead Debt Triage
+  # ============================================================================
+  triage:
+    name: Tech Lead - Debt Triage
+    needs: check-debt
+    if: needs.check-debt.outputs.has_debt == 'true'
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: tech-lead
+      phase: debt-triage
+      issue_number: 0
+      work_branch: main
+      task_prompt: |
+        Daily tech debt triage.
+
+        There are ${{ needs.check-debt.outputs.debt_count }} items in automated/shared/TECH-DEBT.md.
+
+        Your task:
+        1. Read automated/shared/TECH-DEBT.md
+        2. For each unchecked item:
+           - Verify it's still valid (not already fixed)
+           - Assess priority (critical, high, medium, low)
+           - Determine if it should become an issue
+        3. Select up to 2 high-priority items to become GitHub issues
+        4. Update TECH-DEBT.md:
+           - Mark items as [x] if they've been resolved
+           - Add priority notes to items
+           - Move archived items to the Archive section
+        5. Output the issues to create in your result JSON
+
+        Result format for issues_to_create:
+        [
+          {
+            "title": "Issue title",
+            "body": "Issue description with context",
+            "labels": ["tech-debt", "priority:high"]
+          }
+        ]
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Parse triage result
+  # ============================================================================
+  parse-triage:
+    name: Parse Triage Result
+    needs: [check-debt, triage]
+    runs-on: ubuntu-latest
+    outputs:
+      issues_to_create: ${{ steps.parse.outputs.issues_to_create }}
+    steps:
+      - name: Parse triage result
+        id: parse
+        uses: actions/github-script@v7
+        env:
+          RESULT_BASE64: ${{ needs.triage.outputs.result }}
+        with:
+          script: |
+            // Decode base64 result from agent-runner
+            const base64Result = process.env.RESULT_BASE64 || '';
+            let resultJson = '';
+            if (base64Result) {
+              try {
+                resultJson = Buffer.from(base64Result, 'base64').toString('utf8');
+              } catch (e) {
+                console.log('Failed to decode base64:', e.message);
+                resultJson = base64Result;
+              }
+            }
+
+            let result;
+            try {
+              result = JSON.parse(resultJson || '{}');
+            } catch (e) {
+              result = { issues_to_create: [] };
+            }
+            core.setOutput('issues_to_create', JSON.stringify(result.issues_to_create || []));
+
+  # ============================================================================
+  # Create GitHub Issues
+  # ============================================================================
+  create-issues:
+    name: Create Issues
+    needs: parse-triage
+    if: needs.parse-triage.outputs.issues_to_create != '' && needs.parse-triage.outputs.issues_to_create != '[]'
+    runs-on: ubuntu-latest
+    outputs:
+      created_issues: ${{ steps.create.outputs.created_issues }}
+    steps:
+      - name: Create issues from triage
+        id: create
+        uses: actions/github-script@v7
+        env:
+          ISSUES_TO_CREATE: ${{ needs.parse-triage.outputs.issues_to_create }}
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            let issues = [];
+
+            try {
+              issues = JSON.parse(process.env.ISSUES_TO_CREATE || '[]');
+            } catch (e) {
+              console.log('Could not parse issues to create:', e.message);
+              core.setOutput('created_issues', '[]');
+              return;
+            }
+
+            if (!Array.isArray(issues) || issues.length === 0) {
+              console.log('No issues to create');
+              core.setOutput('created_issues', '[]');
+              return;
+            }
+
+            const createdIssues = [];
+
+            for (const issue of issues.slice(0, 2)) { // Max 2 issues per day
+              try {
+                const { data: created } = await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: issue.title,
+                  body: `${issue.body}\n\n---\n\nCreated by Tech Debt Triage workflow`,
+                  labels: issue.labels || ['tech-debt']
+                });
+
+                console.log('Created issue:', created.number, created.title);
+                createdIssues.push({
+                  number: created.number,
+                  title: created.title,
+                  url: created.html_url
+                });
+              } catch (e) {
+                console.log('Failed to create issue:', e.message);
+              }
+            }
+
+            core.setOutput('created_issues', JSON.stringify(createdIssues));
+
+  # ============================================================================
+  # Update TECH-DEBT.md with issue references
+  # ============================================================================
+  update-debt-file:
+    name: Update Debt File
+    needs: [parse-triage, create-issues]
+    if: always() && needs.parse-triage.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+
+      - name: Pull latest
+        run: git pull origin main || true
+
+      - name: Update TECH-DEBT.md with issue references
+        uses: actions/github-script@v7
+        env:
+          CREATED_ISSUES: ${{ needs.create-issues.outputs.created_issues }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            let createdIssues = [];
+            try {
+              createdIssues = JSON.parse(process.env.CREATED_ISSUES || '[]');
+            } catch (e) {}
+
+            if (createdIssues.length === 0) {
+              console.log('No issues were created, skipping update');
+              return;
+            }
+
+            const debtPath = 'automated/shared/TECH-DEBT.md';
+            if (!fs.existsSync(debtPath)) {
+              console.log('TECH-DEBT.md not found');
+              return;
+            }
+
+            let content = fs.readFileSync(debtPath, 'utf8');
+
+            // Add a section for created issues
+            const today = new Date().toISOString().split('T')[0];
+            const issueRefs = createdIssues.map(i => `- #${i.number}: ${i.title}`).join('\n');
+
+            const issuesCreatedSection = `\n## Issues Created (${today})\n\n${issueRefs}\n`;
+
+            // Insert before Archive section if it exists
+            if (content.includes('## Archive')) {
+              content = content.replace('## Archive', issuesCreatedSection + '\n## Archive');
+            } else {
+              content += issuesCreatedSection;
+            }
+
+            fs.writeFileSync(debtPath, content);
+            console.log('Updated TECH-DEBT.md with issue references');
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "chore: tech debt triage - $(date +%Y-%m-%d)"
+          git push || true
+

@@ -1,0 +1,369 @@
+# V2 Triage Workflow - Product Owner evaluates new issues
+# Triggers: New issue opened OR 'work-on-this' label added
+
+name: "V2: 1 - Triage"
+
+on:
+  issues:
+    types: [opened, labeled]
+
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to triage"
+        required: true
+        type: string
+
+concurrency:
+  group: v2-triage-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  # Required for claude-code-action OIDC token requests
+  id-token: write
+
+jobs:
+  # ============================================================================
+  # Check if we should run
+  # ============================================================================
+  should-run:
+    name: Check Trigger
+    runs-on: ubuntu-latest
+    if: |
+      (
+        github.event_name == 'workflow_dispatch' ||
+        github.event.action == 'opened' ||
+        (github.event.action == 'labeled' && github.event.label.name == 'work-on-this')
+      )
+    outputs:
+      issue_number: ${{ steps.determine.outputs.issue_number }}
+      should_run: ${{ steps.determine.outputs.should_run }}
+    steps:
+      - name: Determine issue and check labels
+        id: determine
+        uses: actions/github-script@v7
+        env:
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+        with:
+          script: |
+            let issueNumber;
+
+            if (context.eventName === 'workflow_dispatch') {
+              issueNumber = parseInt(process.env.INPUT_ISSUE_NUMBER, 10);
+              if (isNaN(issueNumber) || issueNumber <= 0) {
+                core.setFailed('Invalid issue number provided');
+                return;
+              }
+            } else {
+              issueNumber = context.payload.issue.number;
+            }
+
+            // Get issue details
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber
+            });
+
+            // Check if already triaged (has a v2:phase: label)
+            const hasPhaseLabel = issue.labels.some(l => l.name.startsWith('v2:phase:'));
+
+            // Check if hotfix (should go to hotfix workflow instead)
+            const isHotfix = issue.labels.some(l =>
+              l.name === 'hotfix' || l.name === 'priority:critical'
+            );
+
+            const shouldRun = !hasPhaseLabel && !isHotfix;
+
+            core.setOutput('issue_number', String(issueNumber));
+            core.setOutput('should_run', String(shouldRun));
+
+            if (isHotfix) {
+              console.log('Issue is a hotfix - skipping triage, should use hotfix workflow');
+            }
+            if (hasPhaseLabel) {
+              console.log('Issue already has phase label - skipping triage');
+            }
+
+  # ============================================================================
+  # Setup - Get issue info and create branch
+  # ============================================================================
+  setup:
+    name: Setup Triage
+    needs: should-run
+    if: needs.should-run.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      work_branch: ${{ steps.branch.outputs.branch }}
+      issue_title: ${{ steps.issue.outputs.title }}
+      issue_body: ${{ steps.issue.outputs.body }}
+      issue_labels: ${{ steps.issue.outputs.labels }}
+      about_content: ${{ steps.about.outputs.content }}
+      slug: ${{ steps.branch.outputs.slug }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          fetch-depth: 0
+
+      - name: Get issue details
+        id: issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.should-run.outputs.issue_number }}
+            });
+
+            core.setOutput('title', issue.title);
+            core.setOutput('body', issue.body || '');
+            core.setOutput('labels', issue.labels.map(l => l.name).join(','));
+
+      - name: Read ABOUT.md for product context
+        id: about
+        run: |
+          if [ -f "ABOUT.md" ]; then
+            ABOUT_CONTENT=$(head -200 ABOUT.md)
+          else
+            ABOUT_CONTENT="No ABOUT.md found"
+          fi
+
+          DELIM="EOF_$(openssl rand -hex 8)"
+          echo "content<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$ABOUT_CONTENT" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
+
+      - name: Setup work branch
+        id: branch
+        run: |
+          # Create slug from issue title
+          SLUG=$(echo "${{ steps.issue.outputs.title }}" | \
+            tr '[:upper:]' '[:lower:]' | \
+            sed 's/[^a-z0-9]/-/g' | \
+            sed 's/--*/-/g' | \
+            sed 's/^-//' | \
+            sed 's/-$//' | \
+            cut -c1-40)
+
+          BRANCH="feat/issue-${{ needs.should-run.outputs.issue_number }}-${SLUG}"
+
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Fetch all remote branches
+          git fetch origin
+
+          # Check if branch already exists on remote
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+            echo "Branch $BRANCH already exists, checking it out"
+            git checkout "$BRANCH"
+            git pull origin "$BRANCH"
+          else
+            echo "Creating new branch $BRANCH from latest main"
+            git checkout main
+            git pull origin main
+            git checkout -b "$BRANCH"
+            git push -u origin "$BRANCH"
+          fi
+
+          echo "Using branch: $BRANCH"
+
+  # ============================================================================
+  # Product Owner Triage
+  # ============================================================================
+  triage:
+    name: Product Owner Triage
+    needs: [should-run, setup]
+    uses: ./.github/workflows/agent-runner.yml
+    with:
+      agent_name: product-owner
+      phase: triage
+      issue_number: ${{ needs.should-run.outputs.issue_number }}
+      work_branch: ${{ needs.setup.outputs.work_branch }}
+      task_prompt: |
+        Triage issue #${{ needs.should-run.outputs.issue_number }}: "${{ needs.setup.outputs.issue_title }}"
+
+        Issue body:
+        ${{ needs.setup.outputs.issue_body }}
+
+        Your task:
+        1. Read ABOUT.md to understand the product vision
+        2. Evaluate if this issue aligns with the product direction
+        3. Make a decision: APPROVED, REJECTED, or NEEDS_INFO
+        4. If approved, write clear acceptance criteria
+        5. Create the issue context file at: automated/shared/issues/${{ needs.should-run.outputs.issue_number }}-${{ needs.setup.outputs.slug }}.md
+
+        Use the template structure from automated/shared/issues/TEMPLATE.md
+    secrets:
+      CLAUDE_WORKFLOW_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      DISCORD_DEV_WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK_URL }}
+
+  # ============================================================================
+  # Parse triage result
+  # ============================================================================
+  parse-triage:
+    name: Parse Triage Result
+    needs: [should-run, triage]
+    runs-on: ubuntu-latest
+    outputs:
+      decision: ${{ steps.parse.outputs.decision }}
+      summary: ${{ steps.parse.outputs.summary }}
+    steps:
+      - name: Parse triage result
+        id: parse
+        uses: actions/github-script@v7
+        env:
+          RESULT_BASE64: ${{ needs.triage.outputs.result }}
+        with:
+          script: |
+            // Decode base64 result from agent-runner
+            const base64Result = process.env.RESULT_BASE64 || '';
+            let resultJson = '';
+
+            console.log('Parsing triage result...');
+            console.log('  Base64 input length:', base64Result.length);
+
+            if (base64Result) {
+              try {
+                resultJson = Buffer.from(base64Result, 'base64').toString('utf8');
+                console.log('  Decoded JSON length:', resultJson.length);
+              } catch (e) {
+                console.log('  Failed to decode base64:', e.message);
+                resultJson = base64Result; // Fallback to raw value
+              }
+            }
+
+            let result;
+            try {
+              result = JSON.parse(resultJson || '{}');
+            } catch (e) {
+              console.log('  Failed to parse JSON:', e.message);
+              result = { success: false, summary: 'Failed to parse result' };
+            }
+
+            console.log('  next_phase_ready:', result.next_phase_ready);
+            console.log('  summary:', result.summary);
+
+            // Determine decision from result
+            let decision = 'unknown';
+            const summary = (result.summary || '').toLowerCase();
+
+            // Primary: check next_phase_ready boolean (most reliable)
+            if (result.next_phase_ready === true) {
+              decision = 'approved';
+            } else if (result.next_phase_ready === false && summary) {
+              // Check summary for rejection/needs-info keywords
+              if (summary.includes('rejected') || summary.includes('decline') || summary.includes('not aligned') || summary.includes('out of scope')) {
+                decision = 'rejected';
+              } else if (summary.includes('needs') || summary.includes('clarif') || summary.includes('missing')) {
+                decision = 'needs_info';
+              }
+            }
+
+            // Fallback: check summary keywords if next_phase_ready not set
+            if (decision === 'unknown' && summary) {
+              if (summary.includes('approved') || summary.includes('accept') || summary.includes('proceed')) {
+                decision = 'approved';
+              } else if (summary.includes('rejected') || summary.includes('decline')) {
+                decision = 'rejected';
+              } else if (summary.includes('needs') && (summary.includes('info') || summary.includes('clarif'))) {
+                decision = 'needs_info';
+              }
+            }
+
+            core.setOutput('decision', decision);
+            core.setOutput('summary', result.summary || '');
+
+            console.log('  Final decision:', decision);
+
+  # ============================================================================
+  # Handle triage decision
+  # ============================================================================
+  handle-decision:
+    name: Handle Decision
+    needs: [should-run, parse-triage]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply labels based on decision
+        uses: actions/github-script@v7
+        env:
+          SUMMARY: ${{ needs.parse-triage.outputs.summary }}
+        with:
+          github-token: ${{ secrets.CLAUDE_WORKFLOW_TOKEN }}
+          script: |
+            const issueNumber = ${{ needs.should-run.outputs.issue_number }};
+            const decision = '${{ needs.parse-triage.outputs.decision }}';
+            const summary = process.env.SUMMARY || '';
+
+            console.log(`Applying decision: ${decision}`);
+            console.log(`Summary: ${summary}`);
+
+            if (decision === 'approved') {
+              // Add phase:planning label to trigger next workflow
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: ['v2:phase:planning', 'v2:triaged']
+              });
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: '✅ **Triage Complete** - Issue approved and moving to planning phase.\n\nAcceptance criteria have been documented in the issue context file.'
+              });
+
+            } else if (decision === 'rejected') {
+              // Close the issue
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                state: 'closed',
+                state_reason: 'not_planned'
+              });
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: ['v2:rejected']
+              });
+
+            } else if (decision === 'needs_info') {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: ['v2:needs-clarification']
+              });
+
+            } else {
+              // Handle unknown/unparseable decision - don't fail silently
+              console.log('Unknown decision, requesting human review');
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: `⚠️ **Triage Error** - Could not determine decision from agent output.\n\n**Decision parsed:** \`${decision}\`\n**Summary:** ${summary || 'none'}\n\nPlease manually review and add \`v2:phase:planning\` label to continue, or close the issue if rejected.`
+              });
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: ['v2:needs-human-review']
+              });
+            }
